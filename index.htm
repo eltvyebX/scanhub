@@ -1,126 +1,667 @@
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ماسح الإشعارات البنكية</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/tesseract.min.js"></script>
-<script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js"></script>
-<script src="https://www.gstatic.com/firebasejs/11.6.1/firebase-database.js"></script>
-<style>
-  .card { @apply bg-white p-4 rounded-lg shadow-md border border-gray-200; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ماسح المعاملات البنكية -  مجهول</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // --- Firebase Imports --- (استيراد مكتبات فايربيس)
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        // تم إضافة signInWithCustomToken لاستخدام مسار المصادقة الموصى به
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, collection, addDoc, query, onSnapshot, serverTimestamp, setLogLevel, deleteDoc, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Global Variables --- (المتغيرات العامة)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        
+        // START: Robust Firebase Config Loading (تحميل إعدادات فايربيس بشكل أقوى)
+        let firebaseConfig = null;
+        if (typeof __firebase_config !== 'undefined') {
+            try {
+                // محاولة تحليل سلسلة الإعدادات الموفرة من البيئة
+                firebaseConfig = JSON.parse(__firebase_config);
+            } catch (e) {
+                console.error("Error parsing __firebase_config:", e);
+                // firebaseConfig يبقى null إذا فشل التحليل، مما يؤدي إلى رسالة الخطأ الودية
+            }
+        }
+        // END: Robust Firebase Config Loading
+
+        const API_KEY = ""; // Canvas provides this
+        const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
+        const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}`;
+        const COLLECTION_NAME = "transactions";
+
+        let db;
+        let auth;
+        let unsubscribe = null; 
+        let transactionsData = [];
+        let currentAuthUID = null; // معرف المستخدم المجهول في Firebase
+
+        // --- Structured Output Schema for Gemini Vision --- (مخطط الإخراج المنظم)
+        const TRANSACTION_SCHEMA = {
+            type: "OBJECT",
+            properties: {
+                trxIdLast4: { type: "STRING", description: "The last 4 alphanumeric digits of the Transaction ID (TrxID)." },
+                date: { type: "STRING", description: "The transaction date in YYYY-MM-DD format." },
+                time: { type: "STRING", description: "The transaction time in HH:MM (24-hour) format." },
+                amount: { type: "NUMBER", description: "The numerical value of the transaction amount." }
+            },
+            required: ["trxIdLast4", "date", "time", "amount"]
+        };
+
+        // --- UI Helper Functions --- (دوال مساعدة لواجهة المستخدم)
+        function setLoading(id, isLoading, text = 'جارٍ التحميل...') {
+            const button = document.getElementById(id);
+            if (button) {
+                button.disabled = isLoading;
+                button.classList.toggle('opacity-50', isLoading);
+                button.textContent = isLoading ? text : button.dataset.originalText;
+            }
+        }
+        
+        function showMessage(type, message, containerId = 'messageContainer') {
+            const container = document.getElementById(containerId);
+            const color = type === 'error' ? 'bg-red-100 text-red-800 border-red-400' : 'bg-green-100 text-green-800 border-green-400';
+            container.innerHTML = `<div class="p-3 rounded-lg border-r-4 ${color} mb-4">${message}</div>`;
+            setTimeout(() => { container.innerHTML = ''; }, 6000);
+        }
+
+        // --- Core Application and Utility Functions ---
+
+        /** Converts File object to a Base64 string for the API payload. */
+        function fileToBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = error => reject(error);
+                reader.readAsDataURL(file);
+            });
+        }
+
+        /** Gemini API Call (with Exponential Backoff) */
+        async function fetchGemini(payload, retries = 3) {
+            if (!navigator.onLine) { throw new Error("لا يمكن الاتصال بواجهة برمجة تطبيقات Gemini. يرجى التحقق من اتصالك بالإنترنت."); }
+            
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.status === 429 && i < retries - 1) {
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+
+                    if (!response.ok) {
+                        const errorBody = await response.json();
+                        throw new Error(`فشل استدعاء API: ${errorBody.error?.message || response.statusText}`);
+                    }
+
+                    return await response.json();
+
+                } catch (error) {
+                    if (i === retries - 1) throw error;
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+            throw new Error("فشل استدعاء Gemini API بعد محاولات متعددة.");
+        }
+
+        /** Step 1: Scan the Image and Extract Data (Gemini Vision) */
+        async function scanTransaction() {
+            if (!currentAuthUID) {
+                showMessage('error', 'الرجاء انتظار تهيئة اتصال قاعدة البيانات أولاً.');
+                return;
+            }
+
+            const imageInput = document.getElementById('imageInput');
+            
+            if (imageInput.files.length === 0) {
+                showMessage('error', 'الرجاء تحديد ملف صورة أولاً.');
+                return;
+            }
+
+            setLoading('scanButton', true);
+
+            try {
+                const file = imageInput.files[0];
+                const base64Image = await fileToBase64(file);
+
+                const systemInstruction = "You are a specialized financial data extractor. Analyze the provided image of a bank transaction receipt or screen and extract the date, time, last 4 digits of the transaction ID (TrxID), and the transaction amount. Output the result strictly as a JSON object matching the required schema.";
+                const userPrompt = "Extract the key transaction details (Date, Time, last 4 digits of TrxID, and Amount) from this image.";
+
+                const payload = {
+                    contents: [
+                        {
+                            role: "user",
+                            parts: [
+                                { text: userPrompt },
+                                {
+                                    inlineData: {
+                                        mimeType: file.type,
+                                        data: base64Image
+                                    }
+                                }
+                    ]
+                        }
+                    ],
+                    systemInstruction: { parts: [{ text: systemInstruction }] },
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: TRANSACTION_SCHEMA
+                    }
+                };
+
+                const result = await fetchGemini(payload);
+                const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!jsonText) throw new Error("API returned no structured content.");
+
+                const extractedData = JSON.parse(jsonText);
+                
+                // Populate the EDITABLE input fields
+                document.getElementById('extractedTrxIdInput').value = extractedData.trxIdLast4 || '';
+                document.getElementById('extractedDateInput').value = extractedData.date || '';
+                document.getElementById('extractedTimeInput').value = extractedData.time || '';
+                document.getElementById('extractedAmountInput').value = extractedData.amount ? parseFloat(extractedData.amount).toFixed(2) : '0.00';
+                
+                document.getElementById('saveButton').disabled = false;
+                
+                showMessage('success', 'تم استخراج البيانات بنجاح! راجع وعدّل الحقول، ثم اضغط على "حفظ المعاملة".');
+                
+            } catch (error) {
+                console.error("Scanning Error:", error);
+                showMessage('error', `فشل المسح: ${error.message}. نظراً لأن هذه الميزة تستخدم الإنترنت، لا يزال بإمكانك إدخال البيانات يدوياً وحفظها.`);
+            } finally {
+                setLoading('scanButton', false);
+            }
+        }
+
+        /** Step 2: Save Edited Data to Firestore */
+        async function saveTransaction() {
+            // التحقق من صلاحية المستخدم ومعرف Firebase UID
+            if (!currentAuthUID) {
+                showMessage('error', 'الرجاء الانتظار حتى يتم تسجيل الدخول المجهول.');
+                return;
+            }
+            
+            // تحقق إضافي لمنع التكرار (منع الضغط المزدوج)
+            const saveButton = document.getElementById('saveButton');
+            if (saveButton.disabled) return;
+
+            setLoading('saveButton', true, 'جارٍ الحفظ...');
+
+            try {
+                // Read data directly from the editable input fields
+                const data = {
+                    date: document.getElementById('extractedDateInput').value || 'N/A', 
+                    time: document.getElementById('extractedTimeInput').value || 'N/A',
+                    trxIdLast4: document.getElementById('extractedTrxIdInput').value || 'N/A',
+                    amount: parseFloat(document.getElementById('extractedAmountInput').value) || 0,
+                };
+
+                if (data.amount === 0) {
+                     showMessage('error', 'المبلغ لا يمكن أن يكون صفراً. يرجى التحقق من البيانات المستخرجة.');
+                     setLoading('saveButton', false);
+                     return;
+                }
+
+                // Private user collection path (يستخدم currentAuthUID ليتطابق مع قواعد الأمان)
+                const collectionPath = `artifacts/${appId}/users/${currentAuthUID}/${COLLECTION_NAME}`;
+                
+                await addDoc(collection(db, collectionPath), {
+                    ...data,
+                    timestamp: serverTimestamp(),
+                    userId: currentAuthUID 
+                });
+
+                // Reset fields after successful save
+                document.getElementById('extractedDateInput').value = '';
+                document.getElementById('extractedTimeInput').value = '';
+                document.getElementById('extractedTrxIdInput').value = '';
+                document.getElementById('extractedAmountInput').value = '0.00';
+                document.getElementById('saveButton').disabled = true;
+
+                showMessage('success', 'تم حفظ المعاملة في قاعدة البيانات!');
+                
+            } catch (error) {
+                console.error("Saving Error:", error);
+                showMessage('error', `فشل حفظ المعاملة: ${error.message}`);
+            } finally {
+                setLoading('saveButton', false, 'حفظ المعاملة');
+            }
+        }
+        window.saveTransaction = saveTransaction; // Make accessible from HTML
+        
+        /** Step 3: Delete Function */
+        async function deleteTransaction(docId) {
+             // التحقق من صلاحية المستخدم ومعرف Firebase UID
+            if (!currentAuthUID) {
+                showMessage('error', 'المصادقة غير جاهزة. لا يمكن الحذف.');
+                return;
+            }
+
+            const confirmDelete = document.getElementById('confirmDeleteModal');
+            // Attach the actual delete logic to the confirm button
+            document.getElementById('confirmDeleteButton').onclick = async () => {
+                confirmDelete.classList.add('hidden');
+                
+                try {
+                    // يستخدم currentAuthUID ليتطابق مع قواعد الأمان
+                    const docPath = `artifacts/${appId}/users/${currentAuthUID}/${COLLECTION_NAME}/${docId}`;
+                    await deleteDoc(doc(db, docPath));
+                    showMessage('success', 'تم حذف المعاملة.');
+                } catch (error) {
+                    console.error("Deletion Error:", error);
+                    showMessage('error', `فشل حذف المعاملة: ${error.message}`);
+                }
+            };
+            
+            // Show custom modal (replacing browser confirm())
+            document.getElementById('cancelDeleteButton').onclick = () => confirmDelete.classList.add('hidden');
+            confirmDelete.classList.remove('hidden');
+        }
+        window.deleteTransaction = deleteTransaction; 
+        
+        /** Step 5: Filter Handler */
+        function handleMonthFilter() {
+            const monthYearInput = document.getElementById('monthYearInput').value.trim();
+            const regex = /^(\d{4})-(\d{2})$/; // YYYY-MM format
+
+            if (monthYearInput === "") {
+                // If empty, reset filter to show all
+                loadTransactionsHistory(null, null);
+                showMessage('success', 'تم إزالة التصفية. عرض جميع المعاملات.');
+                return;
+            }
+
+            if (!regex.test(monthYearInput)) {
+                showMessage('error', 'صيغة الشهر غير صحيحة. يجب أن تكون YYYY-MM، مثل 2024-05.', 'messageContainer');
+                return;
+            }
+
+            const [_, year, month] = monthYearInput.match(regex);
+            
+            // Calculate start and end dates for the month
+            const startDate = `${year}-${month}-01`;
+            const nextMonth = parseInt(month) % 12 + 1;
+            const nextYear = parseInt(month) === 12 ? parseInt(year) + 1 : parseInt(year);
+            const nextMonthPadded = String(nextMonth).padStart(2, '0');
+            const endDateExclusive = `${nextYear}-${nextMonthPadded}-01`;
+            
+            loadTransactionsHistory(startDate, endDateExclusive);
+            showMessage('success', `تطبيق التصفية بنجاح على: ${monthYearInput}.`);
+        }
+        window.handleMonthFilter = handleMonthFilter; 
+
+
+        /** Step 4: Fetch and Display Transaction History */
+        function loadTransactionsHistory(startDate, endDateExclusive) {
+            // التحقق من معرف Firebase UID
+            if (!currentAuthUID) {
+                // Do not load if the application's userId is not set/ready
+                return; 
+            }
+
+            // Stop any existing listener
+            if (unsubscribe) {
+                unsubscribe();
+            }
+
+            // يستخدم currentAuthUID ليتطابق مع قواعد الأمان
+            const collectionPath = `artifacts/${appId}/users/${currentAuthUID}/${COLLECTION_NAME}`;
+            const transactionsList = document.getElementById('transactionsList');
+            let queryConstraints = [];
+            
+            // Add date range filters 
+            if (startDate) {
+                // نستخدم `where` للمقارنة ولكن نتجنب `orderBy` لضمان عدم الحاجة لفهارس إضافية
+                queryConstraints.push(where('date', '>=', startDate));
+            }
+            if (endDateExclusive) {
+                queryConstraints.push(where('date', '<', endDateExclusive));
+            }
+
+            // IMPORTANT: We rely on client-side sorting by timestamp later
+            const q = query(collection(db, collectionPath), ...queryConstraints); 
+
+            transactionsList.innerHTML = '<p class="text-center text-gray-500 p-4">جارٍ تحميل المعاملات المحفوظة...</p>';
+
+            // Start new real-time listener
+            unsubscribe = onSnapshot(q, (snapshot) => {
+                let transactions = [];
+                let totalAmount = 0; 
+
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    const amount = parseFloat(data.amount) || 0;
+                    transactions.push({...data, id: doc.id});
+                    totalAmount += amount; 
+                });
+
+                // Client-side sorting by timestamp (descending) 
+                transactions.sort((a, b) => {
+                    const aTime = a.timestamp ? a.timestamp.toDate().getTime() : 0;
+                    const bTime = b.timestamp ? b.timestamp.toDate().getTime() : 0;
+                    return bTime - aTime;
+                });
+                
+                transactionsData = transactions;
+
+                // --- Display Total Sum (Updated Label) ---
+                const totalDisplay = document.getElementById('totalSumDisplay');
+                totalDisplay.innerHTML = `
+                    <div class="p-4 bg-gray-100 border-2 border-gray-300 rounded-lg text-center">
+                        <p class="text-sm font-medium text-gray-600">إجمالي المبلغ</p>
+                        <p class="text-3xl font-extrabold text-indigo-700 mt-1 ltr-input">$${totalAmount.toFixed(2)}</p>
+                    </div>
+                `;
+                
+                let html = '';
+                transactions.forEach((data) => {
+                    const dateYMD = data.date || 'N/A';
+                    const time = data.time || '';
+                    const amount = data.amount ? parseFloat(data.amount).toFixed(2) : '0.00';
+                    const trxId = data.trxIdLast4 || '----';
+                    
+                    // Convert YYYY-MM-DD to DD-MM-YYYY for display
+                    let dateDmy = dateYMD;
+                    if (dateYMD !== 'N/A' && dateYMD.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                        const [year, month, day] = dateYMD.split('-');
+                        dateDmy = `${day}-${month}-${year}`; 
+                    }
+                    
+                    html += `
+                        <div class="p-4 bg-white rounded-lg border-b border-gray-200 flex justify-between items-center transition hover:bg-gray-50">
+                            <div class="space-y-0.5 text-right">
+                                <p class="text-base font-semibold text-gray-800">معرّف المعاملة (آخر 4): ${trxId}</p>
+                                <p class="text-xl font-extrabold text-green-700 ltr-input">$${amount}</p>
+                                <p class="text-xs text-gray-500">${dateDmy} في ${time}</p>
+                            </div>
+                            <button onclick="deleteTransaction('${data.id}')" id="delete-${data.id}" class="text-red-500 hover:text-red-700 p-2 rounded-full transition" title="حذف المعاملة">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
+                                </svg>
+                            </button>
+                        </div>
+                    `;
+                });
+
+                transactionsList.innerHTML = html.length > 0 ? html : '<p class="text-center text-gray-500 p-4">لم يتم حفظ أي معاملات بعد.</p>';
+            }, (error) => {
+                console.error("Failed to fetch transactions:", error);
+                transactionsList.innerHTML = '<p class="text-center text-red-500 p-4">خطأ في تحميل السجل.</p>';
+            });
+        }
+
+        /** Firebase Initialization and Anonymous Auth */
+        async function initializeFirebase() {
+            const appContainer = document.getElementById('appContainer');
+
+            if (!firebaseConfig) {
+                console.error("Firebase configuration is missing.");
+                appContainer.innerHTML = `
+                    <h2 class="text-3xl font-bold text-red-600 text-center">خطأ في إعداد Firebase</h2>
+                    <p class="text-center text-sm text-gray-600 mt-4">لا يمكن الاتصال بقاعدة البيانات. يُرجى التأكد من توفر إعدادات Firebase.</p>
+                `;
+                return; // CRITICAL: Exit early if config is missing
+            }
+
+            setLogLevel('debug');
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            
+            // 1. Check for the custom token provided by the environment
+            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+            try {
+                let userCredential;
+                if (initialAuthToken) {
+                    // Use custom token if available (platform requirement)
+                    userCredential = await signInWithCustomToken(auth, initialAuthToken);
+                    console.log("Signed in with Custom Token.");
+                } else {
+                    // Fallback to anonymous sign-in
+                    userCredential = await signInAnonymously(auth);
+                    console.log("Signed in Anonymously (No token provided).");
+                }
+                
+                currentAuthUID = userCredential.user.uid;
+                
+                // Update UI with the UID
+                document.getElementById('userIdDisplay').textContent = `هوية المستخدم (ID): ${currentAuthUID}`;
+                
+                // Load data
+                loadTransactionsHistory(null, null);
+
+                // Enable all relevant app buttons
+                document.getElementById('scanButton').disabled = false;
+
+            } catch (error) {
+                console.error("Firebase Auth Error:", error);
+                document.getElementById('userIdDisplay').textContent = `فشل تسجيل الدخول: ${error.message}.`;
+            }
+
+            // Set the initial state for the app buttons
+            document.getElementById('scanButton').dataset.originalText = 'مسح المعاملة';
+            document.getElementById('saveButton').dataset.originalText = 'حفظ المعاملة';
+            document.getElementById('filterButton').dataset.originalText = 'تصفية حسب الشهر';
+        }
+
+        // --- Event Listeners and Init ---
+
+        window.onload = function() {
+            // Disable buttons until auth is complete
+            document.getElementById('scanButton').disabled = true;
+            document.getElementById('saveButton').disabled = true;
+            
+            initializeFirebase();
+            
+            // App Listeners
+            document.getElementById('scanButton').addEventListener('click', scanTransaction);
+            document.getElementById('saveButton').addEventListener('click', saveTransaction);
+            document.getElementById('filterButton').addEventListener('click', handleMonthFilter); 
+            
+            // Image Preview handler and field reset 
+            document.getElementById('imageInput').addEventListener('change', function(event) {
+                const preview = document.getElementById('imagePreview');
+                // Clear all input fields and disable save button on new image load
+                document.getElementById('extractedDateInput').value = '';
+                document.getElementById('extractedTimeInput').value = '';
+                document.getElementById('extractedTrxIdInput').value = '';
+                document.getElementById('extractedAmountInput').value = '0.00';
+                document.getElementById('saveButton').disabled = true;
+
+                if (event.target.files && event.target.files[0]) {
+                    const reader = new FileReader();
+                    reader.onload = function(e) {
+                        preview.src = e.target.result;
+                        preview.classList.remove('hidden');
+                        document.getElementById('previewPlaceholder').classList.add('hidden');
+                    }
+                    reader.readAsDataURL(event.target.files[0]);
+                }
+            });
+        };
+    </script>
+    <style>
+        /* Minimalist Custom styles */
+        .container {
+            max-width: 800px;
+        }
+        .main-button {
+            transition: background-color 0.2s, opacity 0.2s, border-color 0.2s;
+            border-width: 2px;
+            box-shadow: none; 
+        }
+        .main-button:hover:not(:disabled) {
+            opacity: 0.9; 
+            transform: none;
+        }
+        .main-button:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+        .editable-input {
+            border: 1px solid #ddd;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 1em;
+            width: 100%;
+            background-color: white;
+            transition: border-color 0.2s;
+            text-align: right; 
+        }
+        .ltr-input {
+             text-align: left;
+             direction: ltr;
+             font-family: monospace;
+        }
+        .editable-input:focus {
+            outline: none;
+            border-color: #4f46e5; /* indigo-600 */
+            box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
+        }
+        #imagePreview {
+            max-height: 200px;
+            max-width: 100%;
+            height: auto;
+            object-fit: contain;
+            border-radius: 4px;
+            border: 1px solid #eee; 
+        }
+    </style>
 </head>
-<body class="bg-gray-50 min-h-screen p-6 font-sans">
+<body class="bg-gray-50 min-h-screen font-sans antialiased p-4 sm:p-8 text-right">
+    
+    <!-- Main Application Container - Now always visible -->
+    <div id="appContainer" class="container mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-lg border border-gray-200 space-y-8">
+        <header class="text-center border-b pb-4 flex justify-between items-start">
+            <div>
+                <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800">
+                    💰 ماسح المعاملات البنكية 
+                </h1>
+                <p class="mt-2 text-base text-gray-600">
+                    امسح تفاصيل المعاملات من الإيصالات البنكية.
+                </p>
+                <p id="userIdDisplay" class="text-xs text-gray-500 mt-2">جارٍ تسجيل الدخول المجهول...</p>
+            </div>
+        </header>
 
-<div class="container mx-auto max-w-lg space-y-6">
+        <div id="messageContainer"></div>
 
-  <h1 class="text-3xl font-extrabold text-gray-800 text-center">💰 ماسح الإشعارات البنكية</h1>
+        <!-- SECTION 1: Image Upload and Preview -->
+        <section class="space-y-4">
+            <h2 class="text-xl font-semibold text-gray-700 border-b pb-2">1. رفع الصورة</h2>
+            <div class="border border-gray-300 rounded-lg p-4 flex flex-col items-center justify-center">
+                <input type="file" id="imageInput" accept="image/*" class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
+                
+                <div id="previewPlaceholder" class="mt-4 text-gray-400">
+                    سيظهر معاينة الصورة هنا.
+                </div>
+                <img id="imagePreview" class="mt-4 hidden border" alt="Transaction Preview" />
+            </div>
+        </section>
 
-  <!-- رفع الصورة -->
-  <div class="card space-y-3">
-    <h2 class="font-semibold text-gray-700">1️⃣ رفع الصورة</h2>
-    <input type="file" id="imageInput" accept="image/*" class="w-full border p-2 rounded">
-    <button id="scanButton" class="w-full bg-indigo-600 text-white py-2 rounded mt-2 hover:bg-indigo-700">مسح الصورة</button>
-  </div>
+        <!-- SECTION 2: Scanning and Extraction (Editable) -->
+        <section class="space-y-4">
+            <h2 class="text-xl font-semibold text-gray-700 border-b pb-2">2. استخراج وتعديل البيانات</h2>
+            
+            <button id="scanButton"
+                class="main-button w-full px-4 py-3 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700 border-indigo-600 disabled:bg-gray-400">
+                مسح المعاملة
+            </button>
+            
+            <div class="bg-white border border-gray-200 p-4 rounded-lg space-y-3">
+                <h3 class="text-base font-semibold text-gray-800 mb-2">مراجعة وتعديل التفاصيل المستخرجة:</h3>
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-gray-700">
+                    
+                    <!-- TrxID (Last 4) -->
+                    <div class="md:col-span-2">
+                        <label class="block text-sm font-medium text-gray-700 mb-1">معرّف المعاملة (آخر 4 أرقام/حروف)</label>
+                        <input type="text" id="extractedTrxIdInput" class="editable-input ltr-input" value="" placeholder="آخر 4 أرقام" dir="ltr" />
+                    </div>
+                    
+                    <!-- Amount -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">المبلغ ($)</label>
+                        <input type="number" step="0.01" id="extractedAmountInput" class="editable-input ltr-input font-bold text-green-700" value="0.00" dir="ltr" />
+                    </div>
+                    
+                    <!-- Date -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">التاريخ (سنة-شهر-يوم)</label>
+                        <input type="text" id="extractedDateInput" class="editable-input ltr-input" value="" placeholder="YYYY-MM-DD" dir="ltr" />
+                    </div>
+                    
+                    <!-- Time -->
+                    <div class="md:col-span-2">
+                        <label class="block text-sm font-medium text-gray-700 mb-1">الوقت (ساعة:دقيقة)</label>
+                        <input type="text" id="extractedTimeInput" class="editable-input ltr-input" value="" placeholder="HH:MM" dir="ltr" />
+                    </div>
+                </div>
+            </div>
 
-  <!-- عرض البيانات -->
-  <div class="card space-y-3">
-    <h2 class="font-semibold text-gray-700">2️⃣ البيانات المستخرجة</h2>
-    <p>رقم العملية (آخر 4 أرقام): <span id="trxLast4">-</span></p>
-    <p>التاريخ والوقت: <span id="datetime">-</span></p>
-    <p>المبلغ ($): <span id="amount">-</span></p>
-    <button id="saveButton" class="w-full bg-green-500 text-white py-2 rounded mt-2 hover:bg-green-600">حفظ المعاملة</button>
-  </div>
+            <button id="saveButton"
+                data-data=""
+                disabled
+                onclick="saveTransaction()"
+                class="main-button w-full px-4 py-3 bg-green-500 text-white font-semibold rounded-md hover:bg-green-600 disabled:bg-gray-400 border-green-500">
+                حفظ المعاملة
+            </button>
+        </section>
 
-  <!-- سجل المعاملات -->
-  <div class="card space-y-3">
-    <h2 class="font-semibold text-gray-700">3️⃣ سجل المعاملات</h2>
-    <div id="transactionsList" class="space-y-2 text-gray-700">
-      لا توجد معاملات بعد.
+        <!-- SECTION 3: Transaction History -->
+        <section class="space-y-4">
+            <h2 class="text-xl font-semibold text-gray-700 border-b pb-2">3. سجل المعاملات (وقت حقيقي)</h2>
+            
+            <!-- Date Filter Inputs -->
+            <div class="bg-gray-100 p-4 rounded-lg border border-gray-300 space-y-3">
+                <h3 class="text-base font-semibold text-gray-700">التصفية حسب الشهر</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label for="monthYearInput" class="block text-xs font-medium text-gray-600 mb-1">شهر التصفية (سنة-شهر)</label>
+                        <input type="text" id="monthYearInput" class="editable-input ltr-input" placeholder="مثال: 2024-05" dir="ltr" />
+                    </div>
+                    <div class="self-end">
+                        <button id="filterButton" onclick="handleMonthFilter()" class="main-button w-full px-4 py-2 bg-gray-200 text-gray-700 font-semibold rounded-md hover:bg-gray-300 border-gray-300">
+                            تصفية حسب الشهر
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Total Sum Display -->
+            <div id="totalSumDisplay" class="my-6">
+                <!-- Total sum card will be injected here -->
+            </div>
+            
+            <div id="transactionsList" class="space-y-3">
+                <p class="text-center text-gray-500 p-4">جارٍ تحميل المعاملات المحفوظة...</p>
+            </div>
+        </section>
+        
+        <!-- Custom Delete Confirmation Modal -->
+        <div id="confirmDeleteModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50 hidden">
+            <div class="bg-white p-6 rounded-lg shadow-xl w-11/12 max-w-sm">
+                <h3 class="text-lg font-bold text-red-600 mb-3">تأكيد الحذف</h3>
+                <p class="text-gray-700 mb-4">هل أنت متأكد من رغبتك في حذف سجل المعاملة هذا نهائياً؟</p>
+                <div class="flex justify-start space-x-3 space-x-reverse">
+                    <button id="cancelDeleteButton" class="px-4 py-2 text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300 transition">إلغاء</button>
+                    <button id="confirmDeleteButton" class="px-4 py-2 text-white bg-red-600 rounded-md hover:bg-red-700 transition">حذف</button>
+                </div>
+            </div>
+        </div>
     </div>
-  </div>
-
-</div>
-
-<script>
-  // ===== Firebase Config =====
-  const firebaseConfig = {
-    apiKey: "YOUR_API_KEY",
-    authDomain: "YOUR_AUTH_DOMAIN",
-    databaseURL: "YOUR_DATABASE_URL",
-    projectId: "YOUR_PROJECT_ID",
-    storageBucket: "YOUR_STORAGE_BUCKET",
-    messagingSenderId: "YOUR_MSG_SENDER_ID",
-    appId: "YOUR_APP_ID"
-  };
-  const app = firebase.initializeApp(firebaseConfig);
-  const db = firebase.database();
-
-  let extractedData = {};
-
-  const imageInput = document.getElementById('imageInput');
-  const scanButton = document.getElementById('scanButton');
-  const saveButton = document.getElementById('saveButton');
-
-  scanButton.addEventListener('click', async () => {
-    if (!imageInput.files[0]) {
-      alert("الرجاء اختيار صورة أولاً!");
-      return;
-    }
-    scanButton.textContent = "جارٍ المسح...";
-    const file = imageInput.files[0];
-
-    const { data: { text } } = await Tesseract.recognize(file, 'eng+ara', { logger: m => console.log(m) });
-
-    // استخراج البيانات الأساسية
-    const trxMatch = text.match(/Trx\.?ID[:\s]*([A-Za-z0-9]{4,})|رقم العملية[:\s]*([0-9]{4,})/i);
-    const dateMatch = text.match(/\b(\d{4}[-\/]\d{2}[-\/]\d{2})\b/);
-    const timeMatch = text.match(/\b(\d{2}:\d{2})\b/);
-    const amountMatch = text.match(/amount[:\s]*([\d,.]+)|المبلغ[:\s]*([\d,.]+)/i);
-
-    extractedData = {
-      trxLast4: trxMatch ? (trxMatch[1]||trxMatch[2]).slice(-4) : '',
-      datetime: (dateMatch ? dateMatch[1] : '') + ' ' + (timeMatch ? timeMatch[1] : ''),
-      amount: amountMatch ? parseFloat(amountMatch[1]||amountMatch[2].replace(/,/g,'')) : 0
-    };
-
-    document.getElementById('trxLast4').textContent = extractedData.trxLast4 || '-';
-    document.getElementById('datetime').textContent = extractedData.datetime || '-';
-    document.getElementById('amount').textContent = extractedData.amount.toFixed(2) || '-';
-
-    scanButton.textContent = "مسح الصورة";
-  });
-
-  saveButton.addEventListener('click', () => {
-    if (!extractedData.trxLast4) { alert("لا توجد بيانات صالحة للحفظ!"); return; }
-    const newRef = db.ref('receipts').push();
-    newRef.set(extractedData, () => {
-      alert("تم حفظ المعاملة!");
-      loadTransactions();
-    });
-  });
-
-  function loadTransactions() {
-    const list = document.getElementById('transactionsList');
-    db.ref('receipts').once('value', snapshot => {
-      const val = snapshot.val();
-      if (!val) { list.innerHTML = "لا توجد معاملات بعد."; return; }
-      let html = '';
-      Object.values(val).forEach(item => {
-        html += `<div class="p-2 border rounded bg-gray-50">
-          <p>رقم العملية: ${item.trxLast4}</p>
-          <p>التاريخ والوقت: ${item.datetime}</p>
-          <p>المبلغ: $${item.amount.toFixed(2)}</p>
-        </div>`;
-      });
-      list.innerHTML = html;
-    });
-  }
-
-  loadTransactions();
-</script>
-
+    
 </body>
 </html>
