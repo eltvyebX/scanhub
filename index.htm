@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ماسح المعاملات البنكية - تسجيل دخول بالرمز السري</title>
+    <title>ماسح المعاملات البنكية - تصميم بسيط</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module">
         // --- Firebase Imports --- (استيراد مكتبات فايربيس)
@@ -73,8 +73,8 @@
             document.getElementById('authMessageContainer').innerHTML = '';
 
             // CRITICAL CHECK: Ensure Firebase services are initialized
-            if (!isAuthReady || !auth || !db) {
-                showMessage('error', 'خطأ: لم يتم تهيئة اتصال قاعدة البيانات بشكل صحيح.', 'authMessageContainer');
+            if (!auth || !db) {
+                showMessage('error', 'خطأ: لم يتم تهيئة اتصال قاعدة البيانات بشكل صحيح. يرجى الانتظار قليلاً.', 'authMessageContainer');
                 return;
             }
 
@@ -133,8 +133,8 @@
             document.getElementById('authMessageContainer').innerHTML = '';
             
             // CRITICAL CHECK: Ensure Firebase services are initialized
-            if (!isAuthReady || !auth || !db) {
-                showMessage('error', 'خطأ: لم يتم تهيئة اتصال قاعدة البيانات بشكل صحيح.', 'authMessageContainer');
+            if (!auth || !db) {
+                showMessage('error', 'خطأ: لم يتم تهيئة اتصال قاعدة البيانات بشكل صحيح. يرجى الانتظار قليلاً.', 'authMessageContainer');
                 return;
             }
 
@@ -204,6 +204,11 @@
                 
                 document.getElementById('showPin').innerHTML = '';
                 document.getElementById('inputPin').value = '';
+                
+                // Ensure auth buttons are active for new login/registration
+                document.getElementById('registerButton').disabled = false;
+                document.getElementById('loginButton').disabled = false;
+
 
                 showMessage('success', 'تم تسجيل الخروج بنجاح.');
 
@@ -459,7 +464,7 @@
             loadTransactionsHistory(startDate, endDateExclusive);
             showMessage('success', `تطبيق التصفية بنجاح على: ${monthYearInput}.`);
         }
-        window.handleMonthFilter = handleMonthFilter; // Make accessible from HTML (Fixes the ReferenceError)
+        window.handleMonthFilter = handleMonthFilter; 
 
 
         /** Step 4: Fetch and Display Transaction History */
@@ -485,13 +490,10 @@
                 queryConstraints.push(where('date', '>=', startDate));
             }
             if (endDateExclusive) {
-                // To get all dates within the selected month, we query for dates LESS than the first day of the next month.
                 queryConstraints.push(where('date', '<', endDateExclusive));
             }
 
-            // IMPORTANT: Firestore does not support range queries (where('date', '>=', X) and where('date', '<', Y)) 
-            // unless all 'where' clauses are on the same field, which is true here ('date').
-            // We cannot order by timestamp efficiently in this case, so we rely on client-side sorting.
+            // IMPORTANT: We rely on client-side sorting by timestamp later
             const q = query(collection(db, collectionPath), ...queryConstraints); 
 
             transactionsList.innerHTML = '<p class="text-center text-gray-500 p-4">جارٍ تحميل المعاملات المحفوظة...</p>';
@@ -594,6 +596,10 @@
             const app = initializeApp(firebaseConfig);
             db = getFirestore(app);
             auth = getAuth(app);
+            
+            // FIX: Enable auth buttons once services are guaranteed to be initialized
+            document.getElementById('registerButton').disabled = false;
+            document.getElementById('loginButton').disabled = false;
 
             // 1. Handle initial auth token from canvas (if provided)
             if (initialAuthToken) {
@@ -638,6 +644,10 @@
         // --- Event Listeners and Init ---
 
         window.onload = function() {
+            // FIX: Disable buttons immediately until Firebase is ready
+            document.getElementById('registerButton').disabled = true;
+            document.getElementById('loginButton').disabled = true;
+
             initializeFirebase();
             
             // App Buttons Init
@@ -648,7 +658,6 @@
             // App Listeners
             document.getElementById('scanButton').addEventListener('click', scanTransaction);
             document.getElementById('saveButton').addEventListener('click', saveTransaction);
-            // This is the fixed line: handleMonthFilter is now defined above.
             document.getElementById('filterButton').addEventListener('click', handleMonthFilter); 
             
             // Image Preview handler and field reset 
