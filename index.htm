@@ -3,31 +3,33 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ماسح المعاملات البنكية - Gemini & Supabase</title>
+    <title>ماسح المعاملات البنكية - Gemini & Firestore V3</title>
     <script src="https://cdn.tailwindcss.com"></script>
     
-    <!-- Supabase Client Library -->
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    
+    <!-- Firebase/Firestore/Auth Imports for Cloud Storage -->
     <script type="module">
-        // --- Supabase & Gemini Configuration ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, deleteDoc, onSnapshot, collection, addDoc, setLogLevel, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Global Variables --- (المتغيرات العامة)
         
-        // *******************************************************************
-        // !! تنويه هام: يجب استبدال هذه المتغيرات بمفاتيح مشروعك الفعلي في Supabase !!
-        // *******************************************************************
-        const SUPABASE_URL = 'YOUR_SUPABASE_URL'; 
-        const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY'; 
-
-        const COLLECTION_NAME = "transactions"; // اسم جدول PostgreSQL
-        const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
-        const API_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
-        const apiKey = ""; // مفتاح API للذكاء الاصطناعي (يتم توفيره تلقائيًا في بيئة التشغيل)
-
-        // Global Supabase references
-        let supabase;
+        let app, db, auth;
         let userId = 'جارٍ التحميل...';
         let isAuthReady = false;
+
+        // ** Mandatory Canvas Environment Variables **
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        
+        const COLLECTION_NAME = "transactions_for_merchants";
+        const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
+        const API_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
+        const apiKey = ""; // Canvas provides this key automatically
+        
         let transactionsData = [];
+        
 
         // --- UI Helper Functions ---
         function setLoading(id, isLoading, text = 'جارٍ التحميل...') {
@@ -46,97 +48,77 @@
             setTimeout(() => { container.innerHTML = ''; }, 6000);
         }
         
-        // --- Supabase Functions (إدارة البيانات السحابية) ---
+        // --- Firestore Functions (إدارة البيانات السحابية) ---
         
+        /** Gets the collection reference (Using the Public path for shared/merchant data) */
+        function getCollectionRef() {
+            if (!userId || !db) return null;
+            // Path: /artifacts/{appId}/public/data/transactions_for_merchants
+            // Using 'public' ensures all merchants can view the data saved in this app instance.
+            return collection(db, `artifacts/${appId}/public/data/${COLLECTION_NAME}`);
+        }
+
         /** Sets up real-time listener for transaction data */
         function setupTransactionListener() {
-            if (!isAuthReady || !supabase) return;
+            if (!isAuthReady || !db || !userId) return;
 
-            // Supabase Realtime Listener (listening for changes in the 'transactions' table)
-            supabase
-                .channel('public:transactions')
-                .on('postgres_changes', { event: '*', schema: 'public', table: COLLECTION_NAME }, payload => {
-                    console.log('Change received!', payload);
-                    // For simplicity, we just refetch all data on any change
-                    fetchTransactions();
-                })
-                .subscribe((status) => {
-                    if (status === 'SUBSCRIBED') {
-                        console.log("Supabase Realtime Subscribed");
-                        fetchTransactions();
-                    }
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+            
+            // Listen to data changes in real-time (onSnapshot)
+            onSnapshot(collectionRef, (snapshot) => {
+                const tempTransactions = [];
+                snapshot.forEach((doc) => {
+                    tempTransactions.push({ id: doc.id, ...doc.data() });
                 });
-        }
-        
-        /** Fetches all transactions for the current user (if logged in) */
-        async function fetchTransactions() {
-            if (!supabase || !userId || userId === 'anonymous') {
-                transactionsData = [];
+                
+                // Sort client-side by timestamp descending
+                tempTransactions.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)); 
+                transactionsData = tempTransactions;
                 displayTransactionsHistory();
-                return;
-            }
-            
-            // Note: In a real app, you would filter by user_id
-            let { data, error } = await supabase
-                .from(COLLECTION_NAME)
-                .select('*')
-                .order('timestamp', { ascending: false }); // Sort by newest first
-
-            if (error) {
-                console.error("Supabase Fetch Error:", error);
-                showMessage('error', `فشل تحميل البيانات من Supabase: ${error.message}`, 'messageContainer');
-                return;
-            }
-
-            transactionsData = data || [];
-            displayTransactionsHistory();
-            showMessage('success', 'تم تحديث سجل المعاملات من السحابة.', 'messageContainer');
+                
+                showMessage('success', 'تم تحديث سجل المعاملات من السحابة.', 'messageContainer');
+            }, (error) => {
+                console.error("Error setting up Firestore listener:", error);
+                showMessage('error', `فشل تحميل البيانات من السحابة: ${error.message}`, 'messageContainer');
+            });
         }
 
-        /** Saves a single transaction (uses insert) */
+        /** Saves a single transaction (uses addDoc) */
         async function saveTransaction(data) {
-            if (!supabase || !userId || userId === 'anonymous') {
-                showMessage('error', 'لا يمكن الحفظ. يرجى انتظار تسجيل الدخول إلى Supabase.', 'messageContainer');
+            if (!db || !userId) {
+                showMessage('error', 'لا يمكن الحفظ. يرجى انتظار تسجيل الدخول.', 'messageContainer');
                 return;
             }
             
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+
             const newTrx = {
                 timestamp: Date.now(),
                 date: data.date, 
                 time: data.time,
                 trxIdLast4: data.trxIdLast4,
                 amount: data.amount,
-                // Assign to the current user (important for security/filtering)
-                user_id: userId
+                savedBy: userId
             };
 
-            const { error } = await supabase
-                .from(COLLECTION_NAME)
-                .insert([newTrx]); 
-
-            if (error) {
-                 console.error("Supabase Insert Error:", error);
-                 showMessage('error', `فشل حفظ المعاملة: ${error.message}`, 'messageContainer');
-                 return;
-            }
-            // Realtime listener handles history update
-            showMessage('success', 'تم حفظ المعاملة بنجاح في Supabase!');
+            await addDoc(collectionRef, newTrx);
+            showMessage('success', 'تم حفظ المعاملة بنجاح في السحابة!');
         }
 
-        /** Deletes a transaction (uses delete) */
-        async function deleteTransaction(id) {
-            if (!supabase || !userId) return;
+        /** Deletes a transaction (uses deleteDoc) */
+        async function deleteTransaction(docId) {
+            if (!db || !userId) return;
+
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
             
             try {
-                const { error } = await supabase
-                    .from(COLLECTION_NAME)
-                    .delete()
-                    .eq('id', id); // Filter by the transaction ID
-
-                if (error) throw error;
+                await deleteDoc(doc(collectionRef, docId));
                 showMessage('success', 'تم حذف المعاملة من السحابة.', 'messageContainer');
             } catch(error) {
-                 console.error("Supabase Delete Error:", error);
+                 console.error("Error deleting document:", error);
                  showMessage('error', `فشل حذف المعاملة: ${error.message}`, 'messageContainer');
             }
         }
@@ -227,6 +209,7 @@
                     }
                     
                     if (i < MAX_RETRIES - 1) {
+                         // Wait before retry (exponential backoff)
                         await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
                     } else {
                         throw new Error(result.error?.message || "فشل غير معروف في Gemini API بعد عدة محاولات.");
@@ -254,14 +237,10 @@
             }
         }
         
-        /** Step 2: Save Edited Data to Supabase */
+        /** Step 2: Save Edited Data to Firestore */
         async function handleSaveTransaction() {
             const saveButton = document.getElementById('saveButton');
             if (saveButton.disabled) return;
-            if (!isAuthReady || userId === 'anonymous') {
-                 showMessage('error', 'يجب تسجيل الدخول للحفظ. يرجى الانتظار حتى يتم إعداد Supabase.', 'messageContainer');
-                 return;
-            }
 
             setLoading('saveButton', true, 'جارٍ الحفظ...');
 
@@ -280,7 +259,7 @@
                      return;
                 }
 
-                await saveTransaction(data); // Call the Supabase save function
+                await saveTransaction(data); // Call the Firestore save function
 
                 // Reset fields after successful save
                 document.getElementById('extractedDateInput').value = '';
@@ -297,7 +276,7 @@
                 setLoading('saveButton', false, 'حفظ المعاملة');
             }
         }
-        window.handleSaveTransaction = handleSaveTransaction;
+        window.handleSaveTransaction = handleSaveTransaction; 
         
         
         /** Step 5: Filter Handler */
@@ -359,6 +338,7 @@
                 const time = data.time || '';
                 const amount = data.amount ? parseFloat(data.amount).toFixed(2) : '0.00';
                 const trxId = data.trxIdLast4 || '----';
+                const savedBy = data.savedBy ? data.savedBy.substring(0, 8) + '...' : 'Unknown';
                 
                 // Convert YYYY-MM-DD to DD-MM-YYYY for display
                 let dateDmy = dateYMD;
@@ -374,7 +354,7 @@
                         <div class="space-y-0.5 text-right">
                             <p class="text-base font-semibold text-gray-800">معرّف المعاملة (آخر 4): ${trxId}</p>
                             <p class="text-xl font-extrabold text-green-700 ltr-input">$${amount}</p>
-                            <p class="text-xs text-gray-500">${dateDmy} في ${time}</p>
+                            <p class="text-xs text-gray-500">${dateDmy} في ${time} - بواسطة ${savedBy}</p>
                         </div>
                         <button onclick="deleteTransaction('${data.id}')" id="delete-${data.id}" class="text-red-500 hover:text-red-700 p-2 rounded-full transition" title="حذف المعاملة">
                             <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
@@ -388,42 +368,47 @@
             transactionsList.innerHTML = html.length > 0 ? html : '<p class="text-center text-gray-500 p-4">لم يتم حفظ أي معاملات بعد.</p>';
         }
 
-        /** Initialization and Authentication (Supabase) */
-        async function initSupabase() {
-            if (SUPABASE_URL === 'YOUR_SUPABASE_URL' || SUPABASE_ANON_KEY === 'YOUR_SUPABASE_ANON_KEY') {
-                showMessage('error', 'خطأ: يرجى إعداد متغيرات SUPABASE_URL و SUPABASE_ANON_KEY أولاً.', 'messageContainer');
+        /** Initialization and Authentication */
+        async function initFirebase() {
+            if (!firebaseConfig) {
+                showMessage('error', 'خطأ: لم يتم توفير إعدادات Firebase.', 'messageContainer');
                 return;
             }
-            
-            // Initialize Supabase Client
-            supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-                auth: {
-                    persistSession: true, // Keep session active
-                }
-            });
 
-            // 1. Check for existing session or sign in anonymously
-            const { data: { user }, error: authError } = await supabase.auth.getUser();
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('Debug'); 
 
-            if (authError || !user) {
-                // If no user, sign in anonymously (recommended for shared public/merchant use)
-                const { data, error } = await supabase.auth.signInAnonymously();
-                if (error) {
-                    console.error("Supabase Anonymous Sign-in Error:", error);
-                    showMessage('error', `فشل تسجيل الدخول: ${error.message}`, 'messageContainer');
-                    return;
+                // 1. Sign In (using the provided token or anonymously)
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
                 }
-                userId = data.user.id;
-            } else {
-                userId = user.id;
+
+                // 2. Auth State Listener
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        document.getElementById('userIdDisplay').textContent = `معرّف التاجر الحالي: ${userId}`;
+                        setupTransactionListener(); // Start listening to Firestore data
+                    } else {
+                        userId = crypto.randomUUID(); // Fallback ID if sign-in fails
+                        isAuthReady = true; 
+                        document.getElementById('userIdDisplay').textContent = `خطأ في المصادقة. ${userId}`;
+                        showMessage('error', 'فشل تسجيل الدخول التلقائي. قد لا يتم الحفظ بشكل دائم.', 'messageContainer');
+                        transactionsData = [];
+                        displayTransactionsHistory();
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+                showMessage('error', `فشل تهيئة Firebase أو تسجيل الدخول: ${error.message}`, 'messageContainer');
             }
-            
-            isAuthReady = true;
-            document.getElementById('userIdDisplay').textContent = `معرّف التاجر/المستخدم: ${userId}`;
-            
-            // 2. Setup Realtime Listener
-            setupTransactionListener();
-
         }
 
         /** Run on Window Load */
@@ -434,8 +419,8 @@
             document.getElementById('filterButton').dataset.originalText = 'تصفية حسب الشهر';
             document.getElementById('saveButton').disabled = true;
 
-            // Initialize Supabase and start auth process
-            initSupabase(); 
+            // Initialize Firebase and start auth process
+            initFirebase(); 
             
             // App Listeners
             document.getElementById('scanButton').addEventListener('click', scanTransaction);
@@ -519,10 +504,10 @@
     <div id="appContainer" class="container mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-lg border border-gray-200 space-y-8">
         <header class="text-center border-b pb-4">
             <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800">
-                🚀 ماسح المعاملات البنكية (Gemini & Supabase)
+                🚀 ماسح المعاملات البنكية (Gemini & Firestore)
             </h1>
             <p class="mt-2 text-base text-gray-600">
-                استخراج سريع للبيانات باستخدام Gemini API وتخزين سحابي قوي عبر Supabase.
+                استخراج سريع للبيانات باستخدام Gemini API وتخزين سحابي احترافي عبر Firestore.
             </p>
             <p id="userIdDisplay" class="text-xs text-indigo-600 font-semibold mt-2">
                 جارٍ الاتصال بالنظام السحابي...
@@ -595,7 +580,7 @@
 
         <!-- SECTION 3: Transaction History -->
         <section class="space-y-4">
-            <h2 class="text-xl font-semibold text-gray-700 border-b pb-2">3. سجل المعاملات (Supabase)</h2>
+            <h2 class="text-xl font-semibold text-gray-700 border-b pb-2">3. سجل المعاملات (Firestore)</h2>
             
             <!-- Date Filter Inputs -->
             <div class="bg-gray-100 p-4 rounded-lg border border-gray-300 space-y-3">
