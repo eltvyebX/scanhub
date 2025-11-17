@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ماسح المعاملات البنكية   </title>
+    <title>ماسح المعاملات البنكية -  مجهول</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module">
         // --- Firebase Imports --- (استيراد مكتبات فايربيس)
@@ -13,7 +13,19 @@
 
         // --- Global Variables --- (المتغيرات العامة)
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        
+        // START: Robust Firebase Config Loading (تحميل إعدادات فايربيس بشكل أقوى)
+        let firebaseConfig = null;
+        if (typeof __firebase_config !== 'undefined') {
+            try {
+                // Attempt to parse the configuration string provided by the environment
+                firebaseConfig = JSON.parse(__firebase_config);
+            } catch (e) {
+                console.error("Error parsing __firebase_config:", e);
+                // firebaseConfig remains null if parsing fails, triggering the friendly error message
+            }
+        }
+        // END: Robust Firebase Config Loading
 
         const API_KEY = ""; // Canvas provides this
         const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
@@ -521,7 +533,7 @@
         <header class="text-center border-b pb-4 flex justify-between items-start">
             <div>
                 <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800">
-                    💰 ماسح المعاملات البنكية (وصول مجهول)
+                    💰 ماسح المعاملات البنكية 
                 </h1>
                 <p class="mt-2 text-base text-gray-600">
                     امسح تفاصيل المعاملات من الإيصالات البنكية.
