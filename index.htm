@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ماسح المعاملات البنكية</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // --- Firebase Imports (تم إزالة enablePersistence لتجنب خطأ التصدير المستمر) ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        // لاحظ: تم إزالة 'enablePersistence' من هنا للسماح بتحميل باقي الدوال
+        import { getFirestore, collection, addDoc, query, onSnapshot, serverTimestamp, setLogLevel, doc, deleteDoc, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Global Variables (المتغيرات العامة المقدمة من بيئة كانفاس) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        const API_KEY = ""; // بيئة كانفاس توفر هذا
+        const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
+        const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}`;
+        const COLLECTION_NAME = "transactions";
+
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+        let unsubscribe = null; // يحمل الدالة لإيقاف مستمع الوقت الحقيقي
+        let transactionsData = []; // يخزن المعاملات المعروضة حاليًا للتحليل
+
+        // --- Structured Output Schema for Gemini Vision (مخطط الإخراج المنظم لرؤية جمناي) ---
+        const TRANSACTION_SCHEMA = {
+            type: "OBJECT",
+            properties: {
+                trxIdLast4: { type: "STRING", description: "The last 4 alphanumeric digits of the Transaction ID (TrxID)." },
+                date: { type: "STRING", description: "The transaction date in YYYY-MM-DD format." },
+                time: { type: "STRING", description: "The transaction time in HH:MM (24-hour) format." },
+                amount: { type: "NUMBER", description: "The numerical value of the transaction amount." }
+            },
+            required: ["trxIdLast4", "date", "time", "amount"]
+        };
+
+        // --- UI Helper Functions (دوال مساعدة لواجهة المستخدم) ---
+        function setLoading(id, isLoading, text = 'جارٍ المسح...') {
+            const button = document.getElementById(id);
+            if (button) {
+                button.disabled = isLoading;
+                button.classList.toggle('opacity-50', isLoading);
+                button.textContent = isLoading ? text : button.dataset.originalText;
+            }
+        }
+        
+        function showMessage(type, message) {
+            const container = document.getElementById('messageContainer');
+            const color = type === 'error' ? 'bg-red-100 text-red-800 border-red-400' : 'bg-green-100 text-green-800 border-green-400';
+            container.innerHTML = `<div class="p-3 rounded-lg border-r-4 ${color} mb-4">${message}</div>`;
+            setTimeout(() => { container.innerHTML = ''; }, 5000);
+        }
+
+        /** Converts File object to a Base64 string for the API payload. (تحويل ملف إلى Base64) */
+        function fileToBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = error => reject(error);
+                reader.readAsDataURL(file);
+            });
+        }
+
+        /** Gemini API Call (with Exponential Backoff) (نداء API جمناي مع التراجع الأسي) */
+        async function fetchGemini(payload, retries = 3) {
+            // Check for network connection first
+            if (!navigator.onLine) {
+                 throw new Error("Cannot connect to Gemini API. Please check your internet connection.");
+            }
+            
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.status === 429 && i < retries - 1) {
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        console.warn(`Rate limit exceeded. Retrying in ${delay / 1000}s...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+
+                    if (!response.ok) {
+                        const errorBody = await response.json();
+                        throw new Error(`API call failed: ${errorBody.error?.message || response.statusText}`);
+                    }
+
+                    return await response.json();
+
+                } catch (error) {
+                    if (i === retries - 1) throw error;
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+            throw new Error("Gemini API call failed after multiple retries.");
+        }
+
+        /** Step 1: Scan the Image and Extract Data (Gemini Vision) (مسح الصورة واستخراج البيانات) */
+        async function scanTransaction() {
+            const imageInput = document.getElementById('imageInput');
+            
+            if (imageInput.files.length === 0) {
+                showMessage('error', 'الرجاء تحديد ملف صورة أولاً.');
+                return;
+            }
+
+            setLoading('scanButton', true);
+
+            try {
+                const file = imageInput.files[0];
+                const base64Image = await fileToBase64(file);
+
+                const systemInstruction = "You are a specialized financial data extractor. Analyze the provided image of a bank transaction receipt or screen and extract the date, time, last 4 digits of the transaction ID (TrxID), and the transaction amount. Output the result strictly as a JSON object matching the required schema.";
+                const userPrompt = "Extract the key transaction details (Date, Time, last 4 digits of TrxID, and Amount) from this image.";
+
+                const payload = {
+                    contents: [
+                        {
+                            role: "user",
+                            parts: [
+                                { text: userPrompt },
+                                {
+                                    inlineData: {
+                                        mimeType: file.type,
+                                        data: base64Image
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    systemInstruction: { parts: [{ text: systemInstruction }] },
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: TRANSACTION_SCHEMA
+                    }
+                };
+
+                const result = await fetchGemini(payload);
+                const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!jsonText) throw new Error("API returned no structured content.");
+
+                const extractedData = JSON.parse(jsonText);
+                
+                // Populate the EDITABLE input fields (TrxID first)
+                document.getElementById('extractedTrxIdInput').value = extractedData.trxIdLast4 || '';
+                document.getElementById('extractedDateInput').value = extractedData.date || '';
+                document.getElementById('extractedTimeInput').value = extractedData.time || '';
+                document.getElementById('extractedAmountInput').value = extractedData.amount ? parseFloat(extractedData.amount).toFixed(2) : '0.00';
+                
+                document.getElementById('saveButton').disabled = false;
+                
+                showMessage('success', 'تم استخراج البيانات بنجاح! راجع وعدّل الحقول، ثم اضغط على "حفظ المعاملة".');
+                
+            } catch (error) {
+                console.error("Scanning Error:", error);
+                showMessage('error', `فشل المسح: ${error.message}. نظراً لأن هذه الميزة تستخدم الإنترنت، لا يزال بإمكانك إدخال البيانات يدوياً وحفظها.`);
+            } finally {
+                setLoading('scanButton', false);
+            }
+        }
+
+        /** Step 2: Save Edited Data to Firestore (works offline with persistence) (حفظ البيانات في فايرستور) */
+        async function saveTransaction() {
+            if (!userId || !isAuthReady) {
+                showMessage('error', 'المصادقة غير جاهزة. يرجى الانتظار لحظة.');
+                return;
+            }
+
+            setLoading('saveButton', true, 'جارٍ الحفظ...');
+
+            try {
+                // Read data directly from the editable input fields
+                const data = {
+                    date: document.getElementById('extractedDateInput').value || 'N/A', // Stored as YYYY-MM-DD
+                    time: document.getElementById('extractedTimeInput').value || 'N/A',
+                    trxIdLast4: document.getElementById('extractedTrxIdInput').value || 'N/A',
+                    amount: parseFloat(document.getElementById('extractedAmountInput').value) || 0,
+                };
+
+                if (data.amount === 0) {
+                     showMessage('error', 'المبلغ لا يمكن أن يكون صفراً. يرجى التحقق من البيانات المستخرجة.');
+                     setLoading('saveButton', false, 'حفظ المعاملة في فايرستور');
+                     return;
+                }
+
+                // Private user collection path
+                const collectionPath = `artifacts/${appId}/users/${userId}/${COLLECTION_NAME}`;
+                
+                await addDoc(collection(db, collectionPath), {
+                    ...data,
+                    timestamp: serverTimestamp(),
+                    userId: userId 
+                });
+
+                // Reset fields after successful save
+                document.getElementById('extractedDateInput').value = '';
+                document.getElementById('extractedTimeInput').value = '';
+                document.getElementById('extractedTrxIdInput').value = '';
+                document.getElementById('extractedAmountInput').value = '0.00';
+                document.getElementById('saveButton').disabled = true;
+
+                if (!navigator.onLine) {
+                    // رسالة تنبيه المستخدم عند عدم توفر ميزة التخزين دون اتصال 
+                    showMessage('success', 'تم حفظ المعاملة محلياً (لا تتوفر ميزة المزامنة دون اتصال).');
+                } else {
+                    showMessage('success', 'تم حفظ المعاملة في قاعدة البيانات!');
+                }
+                
+            } catch (error) {
+                console.error("Saving Error:", error);
+                showMessage('error', `فشل حفظ المعاملة: ${error.message}`);
+            } finally {
+                setLoading('saveButton', false, 'حفظ المعاملة في فايرستور');
+            }
+        }
+
+        /** Step 3: Delete Function (works offline with persistence) (دالة الحذف) */
+        async function deleteTransaction(docId) {
+            if (!userId || !isAuthReady) {
+                showMessage('error', 'المصادقة غير جاهزة. لا يمكن الحذف.');
+                return;
+            }
+
+            const confirmDelete = document.getElementById('confirmDeleteModal');
+            // Attach the actual delete logic to the confirm button
+            document.getElementById('confirmDeleteButton').onclick = async () => {
+                confirmDelete.classList.add('hidden');
+                
+                try {
+                    const docPath = `artifacts/${appId}/users/${userId}/${COLLECTION_NAME}/${docId}`;
+                    await deleteDoc(doc(db, docPath));
+                    showMessage('success', 'تم حذف المعاملة.');
+                } catch (error) {
+                    console.error("Deletion Error:", error);
+                    showMessage('error', `فشل حذف المعاملة: ${error.message}`);
+                }
+            };
+            
+            // Show custom modal (replacing browser confirm())
+            confirmDelete.classList.remove('hidden');
+            document.getElementById('cancelDeleteButton').onclick = () => confirmDelete.classList.add('hidden');
+        }
+        window.deleteTransaction = deleteTransaction; // Make available to inline HTML
+
+        /** Step 4: Fetch and Display Transaction History (Real-time from cache/server) (جلب وعرض سجل المعاملات) */
+        function loadTransactionsHistory(startDate, endDate) {
+            if (!userId || !isAuthReady) return;
+
+            // Stop any existing listener to prevent duplicates
+            if (unsubscribe) {
+                unsubscribe();
+            }
+
+            const collectionPath = `artifacts/${appId}/users/${userId}/${COLLECTION_NAME}`;
+            const transactionsList = document.getElementById('transactionsList');
+            let queryConstraints = [];
+            
+            // Reset analysis results when data reloads
+            document.getElementById('analysisResult').innerHTML = '';
+
+
+            // Add date range filters using the stored 'date' string (YYYY-MM-DD format allows string comparison)
+            if (startDate) {
+                queryConstraints.push(where('date', '>=', startDate));
+            }
+            if (endDate) {
+                queryConstraints.push(where('date', '<=', endDate));
+            }
+
+            // Construct the query with optional date constraints
+            const q = query(collection(db, collectionPath), ...queryConstraints); 
+
+            transactionsList.innerHTML = '<p class="text-center text-gray-500 p-4">جارٍ تحميل المعاملات المحفوظة...</p>';
+
+            // Start new real-time listener and save the unsubscribe function
+            unsubscribe = onSnapshot(q, (snapshot) => {
+                let transactions = [];
+                let totalAmount = 0; // Initialize total sum
+
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    const amount = parseFloat(data.amount) || 0;
+                    transactions.push({...data, id: doc.id});
+                    totalAmount += amount; // Accumulate the sum
+                });
+
+                // Client-side sorting by timestamp (descending) as Firestore complex queries limit server-side sorting
+                transactions.sort((a, b) => {
+                    const aTime = a.timestamp ? a.timestamp.toDate().getTime() : 0;
+                    const bTime = b.timestamp ? b.timestamp.toDate().getTime() : 0;
+                    return bTime - aTime;
+                });
+                
+                // Store fetched and sorted data globally for analysis feature
+                transactionsData = transactions;
+
+                // --- Display Total Sum ---
+                const totalDisplay = document.getElementById('totalSumDisplay');
+                totalDisplay.innerHTML = `
+                    <div class="p-4 bg-indigo-100 border-2 border-indigo-400 rounded-xl shadow-inner text-center">
+                        <p class="text-xl font-medium text-indigo-700">إجمالي الإنفاق (مُصفَّى)</p>
+                        <p class="text-4xl font-extrabold text-indigo-900 mt-1">$${totalAmount.toFixed(2)}</p>
+                    </div>
+                `;
+                
+                let html = '';
+                transactions.forEach((data) => {
+                    const dateYMD = data.date || 'N/A';
+                    const time = data.time || '';
+                    const amount = data.amount ? parseFloat(data.amount).toFixed(2) : '0.00';
+                    const trxId = data.trxIdLast4 || '----';
+                    
+                    // Convert YYYY-MM-DD to DD-MM-YYYY for display
+                    let dateDmy = dateYMD;
+                    if (dateYMD !== 'N/A' && dateYMD.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                        const [year, month, day] = dateYMD.split('-');
+                        dateDmy = `${day}-${month}-${year}`; // DD-MM-YYYY
+                    }
+                    
+                    html += `
+                        <div class="p-4 bg-white rounded-lg shadow border-r-4 border-indigo-500 flex justify-between items-center transition hover:shadow-md">
+                            <div class="space-y-1 text-right">
+                                <p class="text-lg font-bold text-gray-900">معرّف المعاملة (آخر 4): ${trxId}</p>
+                                <p class="text-xl font-extrabold text-green-700">$${amount}</p>
+                                <p class="text-xs text-gray-500">${dateDmy} في ${time}</p>
+                            </div>
+                            <button onclick="deleteTransaction('${data.id}')" id="delete-${data.id}" class="text-red-500 hover:text-red-700 p-2 rounded-full bg-red-100 transition main-button" title="حذف المعاملة">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
+                                </svg>
+                            </button>
+                        </div>
+                    `;
+                });
+
+                transactionsList.innerHTML = html.length > 0 ? html : '<p class="text-center text-gray-500 p-4">لم يتم حفظ أي معاملات بعد.</p>';
+                document.getElementById('analyzeButton').disabled = transactions.length === 0;
+            }, (error) => {
+                console.error("Failed to fetch transactions:", error);
+                transactionsList.innerHTML = '<p class="text-center text-red-500 p-4">خطأ في تحميل السجل.</p>';
+            });
+        }
+
+        /** Handles Month/Year filter input to calculate date range (معالجة مدخلات تصفية الشهر/السنة) */
+        function handleMonthFilter() {
+            const monthYearString = document.getElementById('monthYearInput').value.trim();
+
+            if (!monthYearString) {
+                // If empty, reload all data
+                loadTransactionsHistory(null, null);
+                document.getElementById('analysisResult').innerHTML = '';
+                return;
+            }
+
+            // Simple validation for YYYY-MM format
+            const parts = monthYearString.match(/^(\d{4})-(\d{2})$/);
+            if (!parts) {
+                showMessage('error', 'الرجاء إدخال الشهر والسنة بالتنسيق YYYY-MM بدقة (مثال: 2024-05).');
+                return;
+            }
+
+            const year = parseInt(parts[1]);
+            const month = parseInt(parts[2]); // 1-indexed month (1-12)
+
+            // Calculate the last day of the target month
+            const lastDayOfMonth = new Date(year, month, 0).getDate();
+            
+            // Construct the start and end date strings for Firestore filtering (YYYY-MM-DD)
+            const startDate = `${monthYearString}-01`;
+            const endDate = `${monthYearString}-${String(lastDayOfMonth).padStart(2, '0')}`;
+
+            loadTransactionsHistory(startDate, endDate);
+        }
+
+        /** Gemini LLM Feature: Analyze Spending (ميزة جمناي لتحليل الإنفاق) */
+        async function analyzeSpending() {
+            if (transactionsData.length === 0) {
+                showMessage('error', 'لم يتم تحميل أي معاملات للتحليل. الرجاء مسح أو حفظ بعض البيانات أولاً.');
+                return;
+            }
+
+            setLoading('analyzeButton', true, 'جارٍ التحليل...');
+            document.getElementById('analysisResult').innerHTML = '<p class="text-center text-indigo-500 italic p-4">جارٍ تدقيق الأرقام وتوليد الرؤى...</p>';
+
+            try {
+                // 1. Prepare data for the prompt
+                const transactionList = transactionsData.map(t => 
+                    `Date: ${t.date}, Amount: $${t.amount.toFixed(2)}, TrxID: ${t.trxIdLast4}`
+                ).join('\n');
+
+                const systemInstruction = "You are a concise financial analyst. Review the provided list of banking transactions. Summarize the total spending, identify the date and amount of the largest transaction, and offer a single, brief observation about the spending habits shown. Respond in a friendly, conversational tone and use markdown for formatting.";
+                
+                const userQuery = `Analyze the following transactions:\n\n${transactionList}`;
+
+                const payload = {
+                    contents: [{ parts: [{ text: userQuery }] }],
+                    systemInstruction: { parts: [{ text: systemInstruction }] },
+                };
+
+                const result = await fetchGemini(payload);
+                const analysisText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                if (!analysisText) throw new Error("API returned no analysis text.");
+
+                // 2. Display Result
+                document.getElementById('analysisResult').innerHTML = `
+                    <div class="p-4 bg-fuchsia-50 border border-fuchsia-300 rounded-xl shadow-lg mt-4">
+                        <h4 class="text-xl font-extrabold text-fuchsia-800 mb-2">✨ لقطتك المالية:</h4>
+                        <div class="prose text-gray-700 text-right">
+                           <p>${analysisText.replace(/\n/g, '<br>')}</p>
+                        </div>
+                    </div>
+                `;
+
+                showMessage('success', 'اكتمل تحليل الإنفاق!');
+
+            } catch (error) {
+                console.error("Analysis Error:", error);
+                document.getElementById('analysisResult').innerHTML = '<p class="text-center text-red-500 p-4">فشل تشغيل التحليل. الرجاء التحقق من اتصالك بالإنترنت.</p>';
+                showMessage('error', `فشل التحليل: ${error.message}. تتطلب هذه الميزة اتصالاً بالإنترنت.`);
+            } finally {
+                setLoading('analyzeButton', false);
+            }
+        }
+
+
+        /** Firebase Initialization and Auth (تهيئة فايربيس والمصادقة) */
+        async function initializeFirebase() {
+            if (!firebaseConfig) return console.error("Firebase config is missing.");
+
+            setLogLevel('debug');
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            
+            // --- OFFLINE PERSISTENCE ISSUE FIX (تم تعطيل ميزة التخزين المؤقت دون اتصال لتجنب خطأ التصدير) ---
+            console.warn("Offline persistence (enablePersistence) is disabled due to a CDN module export error.");
+            // --- END OFFLINE PERSISTENCE ISSUE FIX ---
+
+            // Authentication listener
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                } else {
+                    userId = crypto.randomUUID();
+                    if (initialAuthToken) {
+                        try {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } catch (e) {
+                            console.error("Custom token sign-in failed, falling back to anonymous:", e);
+                            await signInAnonymously(auth);
+                        }
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                }
+                document.getElementById('userIdDisplay').textContent = `هوية المستخدم: ${userId}`;
+                isAuthReady = true;
+                loadTransactionsHistory(null, null); // Initial load without filters
+            });
+        }
+
+        // --- Event Listeners and Init (مستمعات الأحداث والتهيئة) ---
+
+        window.onload = function() {
+            initializeFirebase();
+            
+            document.getElementById('scanButton').dataset.originalText = '⚡ مسح المعاملة (رؤية جمناي)';
+            document.getElementById('saveButton').dataset.originalText = '💾 حفظ المعاملة في فايرستور';
+            document.getElementById('filterButton').dataset.originalText = 'تصفية حسب الشهر';
+            document.getElementById('analyzeButton').dataset.originalText = '✨ تحليل الإنفاق (جمناي)';
+
+
+            document.getElementById('scanButton').addEventListener('click', scanTransaction);
+            document.getElementById('saveButton').addEventListener('click', saveTransaction);
+            document.getElementById('filterButton').addEventListener('click', handleMonthFilter); // Changed listener
+            document.getElementById('analyzeButton').addEventListener('click', analyzeSpending);
+
+
+            // Image Preview handler and field reset (تأكيد أن المعاينة تعمل كما في النسخة المطلوبة)
+            document.getElementById('imageInput').addEventListener('change', function(event) {
+                const preview = document.getElementById('imagePreview');
+                // Clear all input fields and disable save button on new image load
+                document.getElementById('extractedDateInput').value = '';
+                document.getElementById('extractedTimeInput').value = '';
+                document.getElementById('extractedTrxIdInput').value = '';
+                document.getElementById('extractedAmountInput').value = '0.00';
+                document.getElementById('saveButton').disabled = true;
+
+                if (event.target.files && event.target.files[0]) {
+                    const reader = new FileReader();
+                    reader.onload = function(e) {
+                        preview.src = e.target.result;
+                        preview.classList.remove('hidden');
+                        document.getElementById('previewPlaceholder').classList.add('hidden');
+                    }
+                    reader.readAsDataURL(event.target.files[0]);
+                }
+            });
+        };
+    </script>
+    <style>
+        /* Custom styles for a clean interface */
+        .container {
+            max-width: 800px;
+        }
+        .main-button {
+            transition: all 0.2s;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .main-button:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 8px rgba(0, 0, 0, 0.15);
+        }
+        .main-button:disabled {
+            cursor: not-allowed;
+        }
+        .editable-input {
+            border: 1px solid #ccc;
+            padding: 4px 8px;
+            border-radius: 6px; /* Slightly more rounded */
+            font-size: 1em;
+            width: 100%;
+            background-color: white;
+            transition: border-color 0.2s;
+        }
+        .editable-input:focus {
+            outline: none;
+            border-color: #4f46e5; /* indigo-600 */
+            box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
+        }
+        /* Image Preview Styles (تم التأكيد على أن هذه تعمل) */
+        #imagePreview {
+            max-height: 200px;
+            max-width: 100%; /* Ensure it fits container width */
+            height: auto;
+            object-fit: contain;
+            border-radius: 8px;
+            border: 1px solid #ddd; 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen font-sans antialiased p-4 sm:p-8 text-right">
+    <div class="container mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-2xl space-y-8">
+        <header class="text-center border-b pb-4">
+            <h1 class="text-3xl sm:text-4xl font-extrabold text-indigo-700">
+                💰 ماسح المعاملات البنكية
+            </h1>
+            <p class="mt-2 text-lg text-gray-600">
+                امسح تفاصيل المعاملات من الإيصالات باستخدام **رؤية جمناي** واحفظها باستخدام **فايرستور**.
+            </p>
+            <p id="userIdDisplay" class="text-xs text-gray-400 mt-2"></p>
+        </header>
+
+        <div id="messageContainer"></div>
+
+        <!-- SECTION 1: Image Upload and Preview -->
+        <section class="space-y-4">
+            <h2 class="text-2xl font-semibold text-gray-800 border-b pb-2">1. رفع الصورة</h2>
+            <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 flex flex-col items-center justify-center">
+                <input type="file" id="imageInput" accept="image/*" class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" />
+                
+                <div id="previewPlaceholder" class="mt-4 text-gray-400">
+                    سيظهر معاينة الصورة هنا.
+                </div>
+                <img id="imagePreview" class="mt-4 hidden shadow-md" alt="Transaction Preview" />
+            </div>
+        </section>
+
+        <!-- SECTION 2: Scanning and Extraction (Editable) -->
+        <section class="space-y-4">
+            <h2 class="text-2xl font-semibold text-gray-800 border-b pb-2">2. استخراج وتعديل البيانات</h2>
+            
+            <button id="scanButton"
+                class="main-button w-full px-4 py-3 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 text-lg">
+                ⚡ مسح المعاملة 
+            </button>
+            
+            <div class="bg-indigo-50 border border-indigo-200 p-4 rounded-lg shadow-inner space-y-3">
+                <h3 class="text-xl font-bold text-indigo-800 mb-2">مراجعة وتعديل التفاصيل المستخرجة:</h3>
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-gray-700">
+                    
+                    <!-- TrxID (Last 4) is now the first field -->
+                    <div class="md:col-span-2">
+                        <label class="block text-sm font-medium text-gray-700 mb-1">معرّف المعاملة (آخر 4 أرقام)</label>
+                        <input type="text" id="extractedTrxIdInput" class="editable-input font-mono text-left" value="" placeholder="آخر 4 أرقام" dir="ltr" />
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">المبلغ ($)</label>
+                        <input type="number" step="0.01" id="extractedAmountInput" class="editable-input font-bold text-green-700 text-left" value="0.00" dir="ltr" />
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">التاريخ (سنة-شهر-يوم)</label>
+                        <input type="text" id="extractedDateInput" class="editable-input text-left" value="" placeholder="YYYY-MM-DD" dir="ltr" />
+                    </div>
+                    <div class="md:col-span-2">
+                        <label class="block text-sm font-medium text-gray-700 mb-1">الوقت (ساعة:دقيقة)</label>
+                        <input type="text" id="extractedTimeInput" class="editable-input text-left" value="" placeholder="HH:MM" dir="ltr" />
+                    </div>
+                </div>
+            </div>
+
+            <button id="saveButton"
+                data-data=""
+                disabled
+                class="main-button w-full px-4 py-3 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 disabled:bg-gray-400">
+                💾 حفظ المعاملة  
+            </button>
+        </section>
+
+        <!-- SECTION 3: Transaction History -->
+        <section class="space-y-4">
+            <h2 class="text-2xl font-semibold text-gray-800 border-b pb-2">3. سجل المعاملات (وقت حقيقي)</h2>
+            
+            <!-- Date Filter Inputs -->
+            <div class="bg-gray-100 p-4 rounded-lg border border-gray-300 space-y-3">
+                <h3 class="text-lg font-bold text-gray-800">التصفية حسب الشهر</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label for="monthYearInput" class="block text-xs font-medium text-gray-600 mb-1">شهر التصفية (سنة-شهر)</label>
+                        <input type="text" id="monthYearInput" class="editable-input text-left" placeholder="مثال: 2024-05" dir="ltr" />
+                    </div>
+                    <div class="self-end">
+                        <button id="filterButton" class="main-button w-full px-4 py-2 bg-blue-500 text-white font-semibold rounded-lg hover:bg-blue-600 transition">
+                            تصفية حسب الشهر
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- New: Total Sum Display - Moved to the top for mobile visibility -->
+            <div id="totalSumDisplay" class="my-6">
+                <!-- Total sum card will be injected here -->
+            </div>
+            
+            <!-- Gemini Analysis Button and Result -->
+            <button id="analyzeButton"
+                disabled
+                class="main-button w-full px-4 py-3 bg-fuchsia-600 text-white font-bold rounded-lg hover:bg-fuchsia-700 disabled:bg-gray-400">
+                ✨ تحليل الإنفاق (جمناي)
+            </button>
+            <div id="analysisResult" class="mt-4">
+                <!-- Analysis output goes here -->
+            </div>
+            
+            <div id="transactionsList" class="space-y-3">
+                <p class="text-center text-gray-500 p-4">جارٍ تحميل المعاملات المحفوظة...</p>
+            </div>
+        </section>
+        
+        <!-- Custom Delete Confirmation Modal (Replaces browser alert/confirm) -->
+        <div id="confirmDeleteModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50 hidden">
+            <div class="bg-white p-6 rounded-lg shadow-xl w-11/12 max-w-sm">
+                <h3 class="text-lg font-bold text-red-600 mb-3">تأكيد الحذف</h3>
+                <p class="text-gray-700 mb-4">هل أنت متأكد من رغبتك في حذف سجل المعاملة هذا نهائياً؟</p>
+                <div class="flex justify-start space-x-3 space-x-reverse">
+                    <button id="cancelDeleteButton" class="px-4 py-2 text-gray-700 bg-gray-200 rounded-lg hover:bg-gray-300 transition">إلغاء</button>
+                    <button id="confirmDeleteButton" class="px-4 py-2 text-white bg-red-600 rounded-lg hover:bg-red-700 transition">حذف</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
