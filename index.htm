@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ماسح المعاملات البنكية - Gemini & Firestore V3</title>
+    <title>ماسح المعاملات البنكية - Gemini & Firestore V4</title>
     <script src="https://cdn.tailwindcss.com"></script>
     
     <!-- Firebase/Firestore/Auth Imports for Cloud Storage -->
@@ -236,7 +236,8 @@
                 setLoading('scanButton', false);
             }
         }
-        
+        window.scanTransaction = scanTransaction; // FIX: Expose function to global scope
+
         /** Step 2: Save Edited Data to Firestore */
         async function handleSaveTransaction() {
             const saveButton = document.getElementById('saveButton');
@@ -352,7 +353,7 @@
                 html += `
                     <div class="p-4 bg-white rounded-lg border-b border-gray-200 flex justify-between items-center transition hover:bg-gray-50">
                         <div class="space-y-0.5 text-right">
-                            <p class="text-base font-semibold text-gray-800">معرّف المعاملة (آخر 4): ${trxId}</p>
+                            <p class="text-base font-semibold text-gray-800">رقم العملية (اخر 4 ارقام): ${trxId}</p>
                             <p class="text-xl font-extrabold text-green-700 ltr-input">$${amount}</p>
                             <p class="text-xs text-gray-500">${dateDmy} في ${time} - بواسطة ${savedBy}</p>
                         </div>
@@ -504,13 +505,10 @@
     <div id="appContainer" class="container mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-lg border border-gray-200 space-y-8">
         <header class="text-center border-b pb-4">
             <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800">
-                🚀 ماسح المعاملات البنكية (Gemini & Firestore)
+                🚀 ماسح المعاملات البنكية 
             </h1>
             <p class="mt-2 text-base text-gray-600">
-                استخراج سريع للبيانات باستخدام Gemini API وتخزين سحابي احترافي عبر Firestore.
-            </p>
-            <p id="userIdDisplay" class="text-xs text-indigo-600 font-semibold mt-2">
-                جارٍ الاتصال بالنظام السحابي...
+                استخراج بيانات الاشعار البنكي 
             </p>
         </header>
 
@@ -544,22 +542,22 @@
                 
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-gray-700">
                     
-                    <!-- TrxID (Last 4) -->
+                    <!-- TrxID (Last 4) - UPDATED TEXT -->
                     <div class="md:col-span-2">
-                        <label class="block text-sm font-medium text-gray-700 mb-1">معرّف المعاملة (آخر 4 أرقام/حروف)</label>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">رقم العملية (اخر 4 ارقام)</label>
                         <input type="text" id="extractedTrxIdInput" class="editable-input ltr-input" value="" placeholder="آخر 4 أرقام" dir="ltr" />
                     </div>
                     
                     <!-- Amount -->
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1">المبلغ ($)</label>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">المبلغ </label>
                         <input type="number" step="0.01" id="extractedAmountInput" class="editable-input ltr-input font-bold text-green-700" value="0.00" dir="ltr" />
                     </div>
                     
                     <!-- Date -->
                     <div>
                         <label class="block text-sm font-medium text-gray-700 mb-1">التاريخ (سنة-شهر-يوم)</label>
-                        <input type="text" id="extractedDateInput" class="editable-input ltr-input" value="" placeholder="YYYY-MM-DD" dir="ltr" />
+                        <input type="text" id="extractedDateInput" class="editable-input ltr-input" value="" placeholder="DD-MM-YYYY" dir="ltr" />
                     </div>
                     
                     <!-- Time -->
