@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ماسح المعاملات البنكية - Gemini & Firestore V4</title>
+    <title>ماسح المعاملات البنكية - Gemini & Firestore V5</title>
     <script src="https://cdn.tailwindcss.com"></script>
     
     <!-- Firebase/Firestore/Auth Imports for Cloud Storage -->
@@ -107,19 +107,32 @@
             showMessage('success', 'تم حفظ المعاملة بنجاح في السحابة!');
         }
 
-        /** Deletes a transaction (uses deleteDoc) */
+        /** * Deletes a transaction (uses deleteDoc) 
+         * IMPROVED: Added robust error handling to help diagnose deployment issues (e.g., Permission Denied)
+         */
         async function deleteTransaction(docId) {
-            if (!db || !userId) return;
+            if (!db || !userId) {
+                showMessage('error', 'خطأ: لا يمكن إجراء الحذف بدون مصادقة.', 'messageContainer');
+                return;
+            }
 
             const collectionRef = getCollectionRef();
-            if (!collectionRef) return;
+            if (!collectionRef) {
+                showMessage('error', 'خطأ: لم يتم تهيئة مسار البيانات السحابية.', 'messageContainer');
+                return;
+            }
             
             try {
-                await deleteDoc(doc(collectionRef, docId));
-                showMessage('success', 'تم حذف المعاملة من السحابة.', 'messageContainer');
+                const docRef = doc(collectionRef, docId);
+                await deleteDoc(docRef);
+                showMessage('success', 'تم حذف المعاملة من السحابة بنجاح.', 'messageContainer');
             } catch(error) {
                  console.error("Error deleting document:", error);
-                 showMessage('error', `فشل حذف المعاملة: ${error.message}`, 'messageContainer');
+                 // Display the specific Firebase error in the UI to help the user diagnose the Security Rules issue
+                 let errorMessage = error.message.includes('permission denied') 
+                    ? `فشل الحذف: تم رفض الإذن. (قد تكون المشكلة في قواعد أمان Firebase)` 
+                    : `فشل حذف المعاملة: ${error.message}`;
+                 showMessage('error', errorMessage, 'messageContainer');
             }
         }
         window.deleteTransaction = deleteTransaction; 
@@ -505,10 +518,13 @@
     <div id="appContainer" class="container mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-lg border border-gray-200 space-y-8">
         <header class="text-center border-b pb-4">
             <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800">
-                🚀 ماسح المعاملات البنكية 
+                🚀 ماسح المعاملات البنكية (Gemini & Firestore)
             </h1>
             <p class="mt-2 text-base text-gray-600">
-                استخراج بيانات الاشعار البنكي 
+                استخراج سريع للبيانات باستخدام Gemini API وتخزين سحابي احترافي عبر Firestore.
+            </p>
+            <p id="userIdDisplay" class="text-xs text-indigo-600 font-semibold mt-2">
+                جارٍ الاتصال بالنظام السحابي...
             </p>
         </header>
 
@@ -550,14 +566,14 @@
                     
                     <!-- Amount -->
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1">المبلغ </label>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">المبلغ ($)</label>
                         <input type="number" step="0.01" id="extractedAmountInput" class="editable-input ltr-input font-bold text-green-700" value="0.00" dir="ltr" />
                     </div>
                     
                     <!-- Date -->
                     <div>
                         <label class="block text-sm font-medium text-gray-700 mb-1">التاريخ (سنة-شهر-يوم)</label>
-                        <input type="text" id="extractedDateInput" class="editable-input ltr-input" value="" placeholder="DD-MM-YYYY" dir="ltr" />
+                        <input type="text" id="extractedDateInput" class="editable-input ltr-input" value="" placeholder="YYYY-MM-DD" dir="ltr" />
                     </div>
                     
                     <!-- Time -->
