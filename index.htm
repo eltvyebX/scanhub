@@ -3,32 +3,28 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ماسح المعاملات البنكية - تصميم بسيط</title>
+    <title>ماسح المعاملات البنكية   </title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module">
         // --- Firebase Imports --- (استيراد مكتبات فايربيس)
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, onAuthStateChanged, signOut, updateCurrentUser, signInWithCustomToken as authSignInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, getDoc, collection, addDoc, query, onSnapshot, serverTimestamp, setLogLevel, deleteDoc, setDoc, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, collection, addDoc, query, onSnapshot, serverTimestamp, setLogLevel, deleteDoc, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- Global Variables --- (المتغيرات العامة)
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
-        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
         const API_KEY = ""; // Canvas provides this
         const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
         const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}`;
         const COLLECTION_NAME = "transactions";
-        const PIN_REGISTRY_PATH = `artifacts/${appId}/public/data/pins_registry`; // مسار عام لتسجيل الرموز السرية
 
         let db;
         let auth;
-        let isAuthReady = false; // هل المصادقة جاهزة؟
-        let isAuthorized = false; // هل تم التحقق من الرمز السري بنجاح؟ (مفتاح التحكم في UI/Firestore)
         let unsubscribe = null; 
         let transactionsData = [];
-        let currentAuthUID = null; // معرف المستخدم الفعلي في Firebase
+        let currentAuthUID = null; // معرف المستخدم المجهول في Firebase
 
         // --- Structured Output Schema for Gemini Vision --- (مخطط الإخراج المنظم)
         const TRANSACTION_SCHEMA = {
@@ -59,169 +55,6 @@
             setTimeout(() => { container.innerHTML = ''; }, 6000);
         }
 
-        // --- PIN AUTHENTICATION FUNCTIONS --- (دوال مصادقة الرمز السري)
-        
-        /** Generates a random 6-digit PIN. (يولّد رمز سري عشوائي من 6 أرقام) */
-        function generatePin() {
-            return String(Math.floor(100000 + Math.random() * 900000));
-        }
-
-        /** Register a new user by generating a PIN and associating it with a new anonymous UID. */
-        async function registerPin() {
-            const showPinDiv = document.getElementById('showPin');
-            showPinDiv.innerHTML = '';
-            document.getElementById('authMessageContainer').innerHTML = '';
-
-            // CRITICAL CHECK: Ensure Firebase services are initialized
-            if (!auth || !db) {
-                showMessage('error', 'خطأ: لم يتم تهيئة اتصال قاعدة البيانات بشكل صحيح. يرجى الانتظار قليلاً.', 'authMessageContainer');
-                return;
-            }
-
-            setLoading('registerButton', true, 'جارٍ إنشاء الرمز...');
-
-            try {
-                // 1. Sign in anonymously if not already (ensures currentAuthUID is set)
-                if (!currentAuthUID) {
-                     await signInAnonymously(auth);
-                }
-                
-                const newPin = generatePin();
-                
-                // 2. Check if the PIN already exists
-                const pinDocRef = doc(db, PIN_REGISTRY_PATH, newPin);
-                const pinSnap = await getDoc(pinDocRef);
-
-                if (pinSnap.exists()) {
-                    return registerPin(); // Retry if PIN is somehow duplicated
-                }
-
-                // 3. Save the new PIN linked to the current user's UID (currentAuthUID)
-                await setDoc(pinDocRef, { 
-                    uid: currentAuthUID, 
-                    createdAt: serverTimestamp()
-                });
-
-                // 4. Authorization success
-                isAuthorized = true;
-
-                showPinDiv.innerHTML = `<div class="p-4 bg-gray-100 rounded-lg text-center font-bold text-lg text-gray-800 border border-gray-300">
-                                            رمزك السري هو: <span class="ltr-input font-mono text-xl">${newPin}</span>
-                                        </div>
-                                        <p class="text-sm text-center text-red-600 mt-2">احفظ هذا الرمز جيداً. ستحتاجه لتسجيل الدخول!</p>`;
-                
-                showMessage('success', 'تم إنشاء الرمز بنجاح!', 'authMessageContainer');
-                
-                // Transition UI and start data loading
-                document.getElementById('authScreen').classList.add('hidden');
-                document.getElementById('appContainer').classList.remove('hidden');
-                document.getElementById('userIdDisplay').textContent = `هوية المستخدم (ID): ${currentAuthUID}`;
-                loadTransactionsHistory(null, null);
-
-            } catch (error) {
-                console.error("PIN Registration Error:", error);
-                showMessage('error', `فشل إنشاء الرمز: ${error.message}`, 'authMessageContainer');
-            } finally {
-                setLoading('registerButton', false);
-            }
-        }
-        window.registerPin = registerPin; // Make accessible from HTML
-
-        /** Logs in by checking the entered PIN against the registry. */
-        async function loginByPIN() {
-            const inputPin = document.getElementById('inputPin').value.trim();
-            document.getElementById('authMessageContainer').innerHTML = '';
-            
-            // CRITICAL CHECK: Ensure Firebase services are initialized
-            if (!auth || !db) {
-                showMessage('error', 'خطأ: لم يتم تهيئة اتصال قاعدة البيانات بشكل صحيح. يرجى الانتظار قليلاً.', 'authMessageContainer');
-                return;
-            }
-
-            setLoading('loginButton', true, 'جارٍ التحقق...');
-
-            try {
-                if (inputPin.length !== 6 || isNaN(inputPin)) {
-                    showMessage('error', 'الرجاء إدخال رمز سري صحيح مكون من 6 أرقام.', 'authMessageContainer');
-                    setLoading('loginButton', false);
-                    return;
-                }
-                
-                // 1. Ensure the current user is authenticated (anonymous is fine)
-                 if (!currentAuthUID) {
-                     await signInAnonymously(auth);
-                }
-
-                // 2. Look up the PIN in the public registry
-                const pinDocRef = doc(db, PIN_REGISTRY_PATH, inputPin);
-                const pinSnap = await getDoc(pinDocRef);
-
-                if (!pinSnap.exists() || !pinSnap.data().uid) {
-                    throw new Error("الرمز السري غير صحيح أو غير مسجل.");
-                }
-
-                const targetUid = pinSnap.data().uid;
-
-                // 3. CRITICAL CHECK: Ensure the PIN is linked to the currently authenticated UID
-                if (currentAuthUID !== targetUid) {
-                    // This is necessary because we cannot switch the Firebase user's authentication token 
-                    // in this environment. The data stored must belong to the current authenticated UID.
-                    throw new Error("الرمز السري غير صحيح أو غير مسجل لحسابك الحالي. يرجى استخدام الرمز الذي سجلته أو إنشاء رمز جديد.");
-                }
-                
-                // 4. Authorization success
-                isAuthorized = true;
-
-                showMessage('success', 'تم تسجيل الدخول بنجاح!', 'authMessageContainer');
-                
-                // Manually transition UI and start data loading
-                document.getElementById('authScreen').classList.add('hidden');
-                document.getElementById('appContainer').classList.remove('hidden');
-                document.getElementById('userIdDisplay').textContent = `هوية المستخدم (ID): ${currentAuthUID}`;
-                loadTransactionsHistory(null, null);
-
-            } catch (error) {
-                console.error("PIN Login Error:", error);
-                showMessage('error', error.message, 'authMessageContainer');
-            } finally {
-                setLoading('loginButton', false);
-            }
-        }
-        window.loginByPIN = loginByPIN; // Make accessible from HTML
-
-        async function handleSignOut() {
-            try {
-                // Reset the application's authorization state
-                isAuthorized = false; 
-                
-                if (unsubscribe) {
-                     unsubscribe(); // Stop listening to data
-                }
-
-                // Re-enable the auth screen and hide the app container
-                document.getElementById('authScreen').classList.remove('hidden');
-                document.getElementById('appContainer').classList.add('hidden');
-                
-                document.getElementById('showPin').innerHTML = '';
-                document.getElementById('inputPin').value = '';
-                
-                // Ensure auth buttons are active for new login/registration
-                document.getElementById('registerButton').disabled = false;
-                document.getElementById('loginButton').disabled = false;
-
-
-                showMessage('success', 'تم تسجيل الخروج بنجاح.');
-
-                // Note: We don't sign out of Firebase itself to keep the anonymous UID, 
-                // but we hide the data by setting isAuthorized = false.
-                
-            } catch (error) {
-                console.error("Sign Out Error:", error);
-                showMessage('error', 'فشل تسجيل الخروج.');
-            }
-        }
-        window.handleSignOut = handleSignOut; 
-
         // --- Core Application and Utility Functions ---
 
         /** Converts File object to a Base64 string for the API payload. */
@@ -236,7 +69,7 @@
 
         /** Gemini API Call (with Exponential Backoff) */
         async function fetchGemini(payload, retries = 3) {
-            if (!navigator.onLine) { throw new Error("Cannot connect to Gemini API. Please check your internet connection."); }
+            if (!navigator.onLine) { throw new Error("لا يمكن الاتصال بواجهة برمجة تطبيقات Gemini. يرجى التحقق من اتصالك بالإنترنت."); }
             
             for (let i = 0; i < retries; i++) {
                 try {
@@ -254,7 +87,7 @@
 
                     if (!response.ok) {
                         const errorBody = await response.json();
-                        throw new Error(`API call failed: ${errorBody.error?.message || response.statusText}`);
+                        throw new Error(`فشل استدعاء API: ${errorBody.error?.message || response.statusText}`);
                     }
 
                     return await response.json();
@@ -265,13 +98,13 @@
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
             }
-            throw new Error("Gemini API call failed after multiple retries.");
+            throw new Error("فشل استدعاء Gemini API بعد محاولات متعددة.");
         }
 
         /** Step 1: Scan the Image and Extract Data (Gemini Vision) */
         async function scanTransaction() {
-            if (!currentAuthUID || !isAuthorized) {
-                showMessage('error', 'الرجاء تسجيل الدخول أولاً باستخدام الرمز السري لبدء المسح.');
+            if (!currentAuthUID) {
+                showMessage('error', 'الرجاء انتظار تهيئة اتصال قاعدة البيانات أولاً.');
                 return;
             }
 
@@ -341,15 +174,14 @@
         /** Step 2: Save Edited Data to Firestore */
         async function saveTransaction() {
             // التحقق من صلاحية المستخدم ومعرف Firebase UID
-            if (!currentAuthUID || !isAuthorized) {
-                showMessage('error', 'الرجاء تسجيل الدخول أولاً باستخدام الرمز السري.');
+            if (!currentAuthUID) {
+                showMessage('error', 'الرجاء الانتظار حتى يتم تسجيل الدخول المجهول.');
                 return;
             }
             
             // تحقق إضافي لمنع التكرار (منع الضغط المزدوج)
             const saveButton = document.getElementById('saveButton');
             if (saveButton.disabled) return;
-
 
             setLoading('saveButton', true, 'جارٍ الحفظ...');
 
@@ -364,6 +196,7 @@
 
                 if (data.amount === 0) {
                      showMessage('error', 'المبلغ لا يمكن أن يكون صفراً. يرجى التحقق من البيانات المستخرجة.');
+                     setLoading('saveButton', false);
                      return;
                 }
 
@@ -389,16 +222,15 @@
                 console.error("Saving Error:", error);
                 showMessage('error', `فشل حفظ المعاملة: ${error.message}`);
             } finally {
-                // Ensure the button is re-enabled only if the function didn't return early due to an error
                 setLoading('saveButton', false, 'حفظ المعاملة');
             }
         }
         window.saveTransaction = saveTransaction; // Make accessible from HTML
-
+        
         /** Step 3: Delete Function */
         async function deleteTransaction(docId) {
              // التحقق من صلاحية المستخدم ومعرف Firebase UID
-            if (!currentAuthUID || !isAuthorized) {
+            if (!currentAuthUID) {
                 showMessage('error', 'المصادقة غير جاهزة. لا يمكن الحذف.');
                 return;
             }
@@ -445,21 +277,11 @@
             const [_, year, month] = monthYearInput.match(regex);
             
             // Calculate start and end dates for the month
-            // startDate is the first day of the selected month (YYYY-MM-01)
             const startDate = `${year}-${month}-01`;
-            
-            // endDate is the last day of the selected month.
-            // Firestore queries are tricky: we look for transactions *before* the first day of the *next* month.
             const nextMonth = parseInt(month) % 12 + 1;
             const nextYear = parseInt(month) === 12 ? parseInt(year) + 1 : parseInt(year);
             const nextMonthPadded = String(nextMonth).padStart(2, '0');
             const endDateExclusive = `${nextYear}-${nextMonthPadded}-01`;
-            
-            // We use two 'where' clauses on the date string field:
-            // 1. date >= YYYY-MM-01 (Start of the month)
-            // 2. date < YYYY-(MM+1)-01 (Start of the next month)
-            // Note: Since Firestore requires the same field for all 'where' clauses, 
-            // we must ensure the saved 'date' field is a string in YYYY-MM-DD format.
             
             loadTransactionsHistory(startDate, endDateExclusive);
             showMessage('success', `تطبيق التصفية بنجاح على: ${monthYearInput}.`);
@@ -469,9 +291,9 @@
 
         /** Step 4: Fetch and Display Transaction History */
         function loadTransactionsHistory(startDate, endDateExclusive) {
-            // التحقق من صلاحية المستخدم ومعرف Firebase UID
-            if (!currentAuthUID || !isAuthorized) {
-                // Do not load if the application's logical userId is not set/ready
+            // التحقق من معرف Firebase UID
+            if (!currentAuthUID) {
+                // Do not load if the application's userId is not set/ready
                 return; 
             }
 
@@ -565,30 +387,16 @@
             });
         }
 
-        /** Firebase Initialization and Auth */
+        /** Firebase Initialization and Anonymous Auth */
         async function initializeFirebase() {
-            const authScreen = document.getElementById('authScreen');
             const appContainer = document.getElementById('appContainer');
 
             if (!firebaseConfig) {
-                isAuthReady = false; // Set to false to prevent other Firebase calls
                 console.error("Firebase configuration is missing.");
-                
-                document.getElementById('authTitle').textContent = 'خطأ في التهيئة';
-                document.getElementById('authScreen').querySelector('.space-y-6').innerHTML = `
+                appContainer.innerHTML = `
                     <h2 class="text-3xl font-bold text-red-600 text-center">خطأ في إعداد Firebase</h2>
-                    <div class="p-4 rounded-lg border-r-4 bg-red-100 text-red-800 border-red-400 mb-4">
-                        <p class="font-bold mb-2">التطبيق غير قادر على الاتصال بقاعدة البيانات.</p>
-                        <p class="text-sm">
-                            هذا يحدث عادةً عند النشر خارج بيئة Canvas. يُرجى التأكد من توفر
-                            ` + "<code>__firebase_config</code>" + `
-                            في بيئة الاستضافة أو استخدام التطبيق في بيئة مدعومة.
-                        </p>
-                    </div>
+                    <p class="text-center text-sm text-gray-600 mt-4">لا يمكن الاتصال بقاعدة البيانات. يُرجى التأكد من توفر إعدادات Firebase.</p>
                 `;
-                // Keep UI locked on error screen
-                appContainer.classList.add('hidden');
-                authScreen.classList.remove('hidden');
                 return; // CRITICAL: Exit early if config is missing
             }
 
@@ -597,63 +405,39 @@
             db = getFirestore(app);
             auth = getAuth(app);
             
-            // FIX: Enable auth buttons once services are guaranteed to be initialized
-            document.getElementById('registerButton').disabled = false;
-            document.getElementById('loginButton').disabled = false;
+            try {
+                // Sign in anonymously immediately
+                const userCredential = await signInAnonymously(auth);
+                currentAuthUID = userCredential.user.uid;
+                
+                // Update UI with the UID
+                document.getElementById('userIdDisplay').textContent = `هوية المستخدم (ID): ${currentAuthUID}`;
+                
+                // Load data
+                loadTransactionsHistory(null, null);
 
-            // 1. Handle initial auth token from canvas (if provided)
-            if (initialAuthToken) {
-                try {
-                    await authSignInWithCustomToken(auth, initialAuthToken);
-                } catch (e) {
-                    console.warn("Custom token failed or not needed, proceeding to anonymous sign in.", e);
-                }
+                // Enable all relevant app buttons
+                document.getElementById('scanButton').disabled = false;
+
+            } catch (error) {
+                console.error("Anonymous Sign-in Error:", error);
+                document.getElementById('userIdDisplay').textContent = `فشل تسجيل الدخول المجهول: ${error.message}`;
             }
 
-            // 2. Ensure an anonymous user is always signed in
-            if (!auth.currentUser) {
-                 await signInAnonymously(auth);
-            }
-
-            // 3. Authentication listener
-            onAuthStateChanged(auth, async (user) => {
-                currentAuthUID = user ? user.uid : null;
-                isAuthReady = true;
-
-                // Only transition to app if Firebase UID is set AND PIN is authorized
-                if (currentAuthUID && isAuthorized) { 
-                    appContainer.classList.remove('hidden');
-                    authScreen.classList.add('hidden');
-                    document.getElementById('userIdDisplay').textContent = `هوية المستخدم (ID): ${currentAuthUID}`;
-                    loadTransactionsHistory(null, null); 
-                } else {
-                    appContainer.classList.add('hidden');
-                    authScreen.classList.remove('hidden');
-                    document.getElementById('userIdDisplay').textContent = `الرجاء تسجيل الدخول بالرمز السري.`;
-                    if (unsubscribe) {
-                         unsubscribe(); 
-                    }
-                }
-            });
-
-            // Set the initial state for the auth buttons
-            document.getElementById('registerButton').dataset.originalText = 'إنشاء رمز سري';
-            document.getElementById('loginButton').dataset.originalText = 'تسجيل الدخول';
+            // Set the initial state for the app buttons
+            document.getElementById('scanButton').dataset.originalText = 'مسح المعاملة';
+            document.getElementById('saveButton').dataset.originalText = 'حفظ المعاملة';
+            document.getElementById('filterButton').dataset.originalText = 'تصفية حسب الشهر';
         }
 
         // --- Event Listeners and Init ---
 
         window.onload = function() {
-            // FIX: Disable buttons immediately until Firebase is ready
-            document.getElementById('registerButton').disabled = true;
-            document.getElementById('loginButton').disabled = true;
-
-            initializeFirebase();
+            // Disable buttons until auth is complete
+            document.getElementById('scanButton').disabled = true;
+            document.getElementById('saveButton').disabled = true;
             
-            // App Buttons Init
-            document.getElementById('scanButton').dataset.originalText = 'مسح المعاملة';
-            document.getElementById('saveButton').dataset.originalText = 'حفظ المعاملة';
-            document.getElementById('filterButton').dataset.originalText = 'تصفية حسب الشهر';
+            initializeFirebase();
             
             // App Listeners
             document.getElementById('scanButton').addEventListener('click', scanTransaction);
@@ -732,67 +516,18 @@
 </head>
 <body class="bg-gray-50 min-h-screen font-sans antialiased p-4 sm:p-8 text-right">
     
-    <!-- Authentication Screen (تسجيل الدخول بالرمز السري) -->
-    <div id="authScreen" class="fixed inset-0 bg-white flex items-center justify-center z-50">
-        <div class="p-8 rounded-xl w-11/12 max-w-md space-y-6 border border-gray-200 shadow-lg">
-            <h2 id="authTitle" class="text-3xl font-bold text-gray-800 text-center">تسجيل الدخول بالرمز السري</h2>
-            <p class="text-center text-gray-500">
-                إذا كانت هذه أول مرة لك، اضغط على زر إنشاء رمز سري.
-            </p>
-
-            <div id="authMessageContainer"></div> 
-
-            <!-- PIN Registration Section -->
-            <div class="space-y-4 pt-2">
-                <button id="registerButton"
-                    onclick="registerPin()"
-                    data-original-text="إنشاء رمز سري"
-                    class="main-button w-full px-4 py-3 bg-blue-500 text-white font-semibold rounded-md hover:bg-blue-600 border-blue-500">
-                    إنشاء رمز سري
-                </button>
-                <div id="showPin" class="mt-4">
-                    <!-- The generated PIN will appear here -->
-                </div>
-            </div>
-
-            <!-- PIN Login Section -->
-            <div class="space-y-4 pt-4 border-t border-gray-200">
-                <div>
-                    <label for="inputPin" class="block text-sm font-medium text-gray-700 mb-1">أدخل الرمز السري</label>
-                    <input type="tel" id="inputPin" maxlength="6" class="editable-input ltr-input text-center text-xl font-mono" placeholder="123456" dir="ltr" />
-                </div>
-
-                <button id="loginButton"
-                    onclick="loginByPIN()"
-                    data-original-text="تسجيل الدخول"
-                    class="main-button w-full px-4 py-3 bg-indigo-500 text-white font-semibold rounded-md hover:bg-indigo-600 border-indigo-500">
-                    تسجيل الدخول
-                </button>
-            </div>
-            
-        </div>
-    </div>
-    
-    <!-- Main Application Container -->
-    <div id="appContainer" class="container mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-lg border border-gray-200 space-y-8 hidden">
+    <!-- Main Application Container - Now always visible -->
+    <div id="appContainer" class="container mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-lg border border-gray-200 space-y-8">
         <header class="text-center border-b pb-4 flex justify-between items-start">
             <div>
                 <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800">
-                    💰 ماسح المعاملات البنكية
+                    💰 ماسح المعاملات البنكية (وصول مجهول)
                 </h1>
                 <p class="mt-2 text-base text-gray-600">
                     امسح تفاصيل المعاملات من الإيصالات البنكية.
                 </p>
-                <p id="userIdDisplay" class="text-xs text-gray-500 mt-2"></p>
+                <p id="userIdDisplay" class="text-xs text-gray-500 mt-2">جارٍ تسجيل الدخول المجهول...</p>
             </div>
-            
-            <!-- Sign Out Button -->
-            <button onclick="handleSignOut()" class="main-button px-3 py-1 bg-white text-red-500 border-2 border-red-500 font-semibold rounded-md hover:bg-red-50 transition text-sm flex items-center">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 ml-1" viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M3 3a1 1 0 011-1h6a1 1 0 110 2H4v10h2a1 1 0 110 2H4a2 2 0 01-2-2V4a2 2 0 012-2zm13.707 6.707a1 1 0 010 1.414l-4 4a1 1 0 01-1.414-1.414L14.586 11H10a1 1 0 110-2h4.586l-1.293-1.293a1 1 0 011.414-1.414l4 4z" clip-rule="evenodd" />
-                </svg>
-                خروج
-            </button>
         </header>
 
         <div id="messageContainer"></div>
@@ -815,7 +550,7 @@
             <h2 class="text-xl font-semibold text-gray-700 border-b pb-2">2. استخراج وتعديل البيانات</h2>
             
             <button id="scanButton"
-                class="main-button w-full px-4 py-3 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700 border-indigo-600">
+                class="main-button w-full px-4 py-3 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700 border-indigo-600 disabled:bg-gray-400">
                 مسح المعاملة
             </button>
             
