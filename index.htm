@@ -3,19 +3,33 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ماسح المعاملات البنكية - Tesseract & LocalStorage</title>
+    <title>ماسح المعاملات البنكية - Gemini & Firestore</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Tesseract.js for Client-Side OCR -->
-    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    
+    <!-- Firebase/Firestore/Auth Imports for Cloud Storage -->
     <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, deleteDoc, onSnapshot, collection, addDoc, setLogLevel, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
         // --- Global Variables --- (المتغيرات العامة)
-        // يتم استخدام AppId لتعيين نطاق لبيانات localStorage
+        
+        // Global Firebase/Auth/DB references
+        let app, db, auth;
+        let userId = 'جارٍ التحميل...';
+        let isAuthReady = false;
+
+        // MANDATORY Firebase Config from environment
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const LOCAL_STORAGE_KEY = `trx_scanner_${appId}`;
         const COLLECTION_NAME = "transactions";
+        const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
+        const API_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
 
         let transactionsData = [];
-        let worker = null; // Tesseract Worker
+        
 
         // --- UI Helper Functions --- (دوال مساعدة لواجهة المستخدم)
         function setLoading(id, isLoading, text = 'جارٍ التحميل...') {
@@ -33,179 +47,181 @@
             container.innerHTML = `<div class="p-3 rounded-lg border-r-4 ${color} mb-4">${message}</div>`;
             setTimeout(() => { container.innerHTML = ''; }, 6000);
         }
-
-        // --- Local Storage Functions (استبدال Firebase) ---
         
-        /** Loads transactions from local storage. */
-        function loadTransactions() {
-            try {
-                const storedData = localStorage.getItem(LOCAL_STORAGE_KEY);
-                if (storedData) {
-                    transactionsData = JSON.parse(storedData);
-                    // Sort client-side by timestamp descending
-                    transactionsData.sort((a, b) => b.timestamp - a.timestamp);
-                } else {
-                    transactionsData = [];
-                }
-            } catch (error) {
-                console.error("Error loading from localStorage:", error);
-                transactionsData = [];
-            }
-            displayTransactionsHistory();
-        }
-
-        /** Saves the current transaction list to local storage. */
-        function saveTransactionsToLocal() {
-            try {
-                localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(transactionsData));
-            } catch (error) {
-                console.error("Error saving to localStorage:", error);
-                showMessage('error', 'فشل حفظ البيانات. يرجى التحقق من إعدادات التخزين المحلي لمتصفحك.', 'messageContainer');
-            }
-        }
-
-        /** Saves a single transaction (replaces addDoc in Firestore) */
-        function saveTransaction(data) {
-            const newTrx = {
-                id: crypto.randomUUID(), // Unique ID for deletion
-                timestamp: Date.now(),
-                ...data
-            };
-            transactionsData.unshift(newTrx); // Add to the start
-            saveTransactionsToLocal();
-            displayTransactionsHistory();
-            showMessage('success', 'تم حفظ المعاملة في التخزين المحلي للمتصفح!');
-        }
+        // --- Firestore Functions (إدارة البيانات السحابية) ---
         
-        /** Deletes a transaction (replaces deleteDoc in Firestore) */
-        function deleteTransaction(docId) {
-            const index = transactionsData.findIndex(trx => trx.id === docId);
-            if (index !== -1) {
-                transactionsData.splice(index, 1);
-                saveTransactionsToLocal();
+        /** Gets the collection reference (Public data path for shared artifacts) */
+        function getCollectionRef() {
+            if (!userId || !db) return null;
+            // Path: /artifacts/{appId}/public/data/transactions
+            return collection(db, `artifacts/${appId}/public/data/${COLLECTION_NAME}`);
+        }
+
+        /** Sets up real-time listener for transaction data */
+        function setupTransactionListener() {
+            if (!isAuthReady || !db || !userId) return;
+
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+            
+            // Listen to data changes in real-time (onSnapshot)
+            onSnapshot(collectionRef, (snapshot) => {
+                const tempTransactions = [];
+                snapshot.forEach((doc) => {
+                    tempTransactions.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // Sort client-side by timestamp descending
+                tempTransactions.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)); 
+                transactionsData = tempTransactions;
                 displayTransactionsHistory();
-                showMessage('success', 'تم حذف المعاملة من التخزين المحلي.');
-            }
-        }
-        window.deleteTransaction = deleteTransaction; 
-
-        // --- Tesseract OCR and Parsing Functions ---
-
-        /** Converts File object to a Base64 string for Tesseract. */
-        function fileToTesseractInput(file) {
-            // Tesseract can often take the File object directly, but for consistency/preview:
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(reader.result);
-                reader.onerror = error => reject(error);
-                reader.readAsDataURL(file);
+                
+                showMessage('success', 'تم تحديث سجل المعاملات من السحابة.', 'messageContainer');
+            }, (error) => {
+                console.error("Error setting up Firestore listener:", error);
+                showMessage('error', `فشل تحميل البيانات من السحابة: ${error.message}`, 'messageContainer');
             });
         }
 
-        /** Tesseract OCR Parsing Logic (استخلاص البيانات من النص الخام) */
-        function parseOCRText(text) {
-            const data = {
-                trxIdLast4: 'N/A',
-                date: 'N/A',
-                time: 'N/A',
-                amount: 0.00
+        /** Saves a single transaction (uses addDoc) */
+        async function saveTransaction(data) {
+            if (!db || !userId) {
+                showMessage('error', 'لا يمكن الحفظ. يرجى انتظار تسجيل الدخول.', 'messageContainer');
+                return;
+            }
+            
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+
+            const newTrx = {
+                timestamp: Date.now(),
+                date: data.date, 
+                time: data.time,
+                trxIdLast4: data.trxIdLast4,
+                amount: data.amount,
+                // Optional: Store the user who saved it
+                savedBy: userId
             };
 
-            // 1. Amount (Find currency symbols or just large numbers/decimals)
-            // يبحث عن رقم بفاصلة عشرية مسبوقًا برمز عملة محتمل (مثل $، SAR، د.إ) أو كلمة (مثل amount, total)
-            const amountRegex = /(?:[A-Z$]|SAR|د\.إ|ريال|دولار|مبلغ|Amount|Total|القيمة)\s*[:=]?\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+\.\d{1,2})/i;
-            
-            const amountMatch = text.match(amountRegex);
-            if (amountMatch) {
-                // تنظيف الفواصل (Commas/Spaces) واستخراج القيمة كعدد
-                const cleanAmount = amountMatch[1].replace(/[,\s]/g, '');
-                data.amount = parseFloat(cleanAmount) || 0;
-            } else {
-                 // fallback for simple number with two decimals
-                 const simpleAmountRegex = /\b(\d+\.\d{2})\b/;
-                 const simpleAmountMatch = text.match(simpleAmountRegex);
-                 if (simpleAmountMatch) {
-                    data.amount = parseFloat(simpleAmountMatch[1]) || 0;
-                 }
-            }
-
-
-            // 2. Date (YYYY-MM-DD or DD/MM/YYYY or YYYY/MM/DD) -> Standardize to YYYY-MM-DD
-            const dateRegex1 = /(\d{4})[-/](\d{1,2})[-/](\d{1,2})/; // YYYY-MM-DD
-            const dateRegex2 = /(\d{1,2})[-/](\d{1,2})[-/](\d{4})/; // DD/MM/YYYY
-
-            let dateMatch = text.match(dateRegex1);
-            if (dateMatch) {
-                data.date = `${dateMatch[1]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[3].padStart(2, '0')}`;
-            } else {
-                dateMatch = text.match(dateRegex2);
-                if (dateMatch) {
-                    data.date = `${dateMatch[3]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[1].padStart(2, '0')}`;
-                }
-            }
-
-            // 3. Time (HH:MM or HH:MM:SS) -> Standardize to HH:MM
-            const timeRegex = /\b(\d{1,2}):(\d{2})(?::\d{2})?\s*(?:AM|PM|ص|م|صباحا|مساء)?\b/g;
-            const timeMatch = Array.from(text.matchAll(timeRegex)).pop(); // خذ آخر وقت تم العثور عليه
-            if (timeMatch) {
-                data.time = `${timeMatch[1].padStart(2, '0')}:${timeMatch[2]}`;
-            }
-
-            // 4. TrxID (آخر 4 محارف)
-            const trxIdKeywordsRegex = /(?:TrxID|ID|Reference|المرجع|المعاملة|رقم)\s*[:#]*\s*([A-Z0-9]{4,})/i;
-            const trxIdMatch = text.match(trxIdKeywordsRegex);
-            if (trxIdMatch) {
-                // استخراج آخر 4 محارف
-                const fullId = trxIdMatch[1].replace(/[^A-Z0-9]/ig, ''); 
-                data.trxIdLast4 = fullId.slice(-4).toUpperCase();
-            } else {
-                 // Fallback: البحث عن أي سلسلة من 4-8 أحرف/أرقام كبيرة
-                 const genericIdRegex = /([A-Z0-9]{4,8})/g;
-                 const genericMatches = Array.from(text.matchAll(genericIdRegex)).map(m => m[1]);
-                 if(genericMatches.length > 0) {
-                     data.trxIdLast4 = genericMatches.pop().slice(-4).toUpperCase();
-                 }
-            }
-            
-            // Log the raw text for debugging regex
-            console.log("OCR Raw Text:", text);
-            console.log("Parsed Data:", data);
-
-            return data;
+            await addDoc(collectionRef, newTrx);
+            // The onSnapshot listener handles refreshing the history
+            showMessage('success', 'تم حفظ المعاملة بنجاح في السحابة!');
         }
 
+        /** Deletes a transaction (uses deleteDoc) */
+        async function deleteTransaction(docId) {
+            if (!db || !userId) return;
 
-        /** Step 1: Scan the Image and Extract Data (Tesseract OCR) */
+            const collectionRef = getCollectionRef();
+            if (!collectionRef) return;
+            
+            try {
+                await deleteDoc(doc(collectionRef, docId));
+                showMessage('success', 'تم حذف المعاملة من السحابة.', 'messageContainer');
+            } catch(error) {
+                 console.error("Error deleting document:", error);
+                 showMessage('error', `فشل حذف المعاملة: ${error.message}`, 'messageContainer');
+            }
+        }
+        window.deleteTransaction = deleteTransaction; 
+        
+        // --- Gemini API Scanning Logic ---
+
+        /** Step 1: Scan the Image and Extract Data (Gemini API) */
         async function scanTransaction() {
             const imageInput = document.getElementById('imageInput');
-            
             if (imageInput.files.length === 0) {
-                showMessage('error', 'الرجاء تحديد ملف صورة أولاً.');
+                showMessage('error', 'الرجاء تحديد ملف صورة أولاً.', 'messageContainer');
                 return;
             }
 
-            setLoading('scanButton', true, 'جارٍ المسح...');
+            const file = imageInput.files[0];
+            setLoading('scanButton', true, 'جارٍ المسح باستخدام Gemini API...');
 
             try {
-                const file = imageInput.files[0];
-                const imageSrc = await fileToTesseractInput(file);
+                // 1. Read file as Base64
+                const base64Data = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result.split(',')[1]);
+                    reader.onerror = error => reject(error);
+                    reader.readAsDataURL(file);
+                });
 
-                // Check and create Tesseract worker
-                if (!worker) {
-                     setLoading('scanButton', true, 'جارٍ تهيئة Tesseract...');
-                    // استخدام eng+ara لزيادة دقة التعرف على النصوص المختلطة
-                    worker = await Tesseract.createWorker('eng+ara'); 
+                // 2. Define the prompt for structured data extraction
+                const userPrompt = `
+                    أنت خبير في استخراج البيانات من إيصالات ومعاملات الدفع.
+                    قم بتحليل هذه الصورة واستخرج القيم التالية بدقة:
+                    1. المبلغ (Amount): القيمة العددية فقط، بدون رموز عملة.
+                    2. التاريخ (Date): بصيغة YYYY-MM-DD.
+                    3. الوقت (Time): بصيغة HH:MM (بنظام 24 ساعة).
+                    4. معرّف المعاملة (TrxId): آخر 4 محارف (أرقام/حروف) من رقم مرجعي للمعاملة.
+                    
+                    يجب أن تكون الإجابة بصيغة JSON فقط، مطابقة للمخطط المحدد.
+                    إذا لم يتم العثور على قيمة، استخدم القيمة null.
+                `;
+                
+                // 3. Define JSON Schema for Structured Output
+                const payload = {
+                    contents: [{
+                        role: "user",
+                        parts: [
+                            { text: userPrompt },
+                            {
+                                inlineData: {
+                                    mimeType: file.type,
+                                    data: base64Data
+                                }
+                            }
+                        ]
+                    }],
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: {
+                            type: "OBJECT",
+                            properties: {
+                                "amount": { "type": "NUMBER", description: "المبلغ العددي للمعاملة." },
+                                "date": { "type": "STRING", description: "التاريخ بصيغة YYYY-MM-DD." },
+                                "time": { "type": "STRING", description: "الوقت بصيغة HH:MM (24 ساعة)." },
+                                "trxIdLast4": { "type": "STRING", description: "آخر 4 محارف من معرّف المعاملة." }
+                            },
+                            required: ["amount", "date", "time", "trxIdLast4"]
+                        }
+                    },
+                };
+
+                // 4. API Call with exponential backoff for reliability
+                const apiKey = ""; 
+                const apiUrl = `${API_URL_BASE}${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+                
+                let response;
+                let result;
+                const MAX_RETRIES = 3;
+
+                for (let i = 0; i < MAX_RETRIES; i++) {
+                    response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    result = await response.json();
+                    
+                    if (response.status === 200 && result.candidates && result.candidates.length > 0) {
+                        break; // Success
+                    }
+                    
+                    if (i < MAX_RETRIES - 1) {
+                         // Wait before retry (exponential backoff)
+                        await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+                    } else {
+                        throw new Error(result.error?.message || "فشل غير معروف في Gemini API بعد عدة محاولات.");
+                    }
                 }
 
-                // Run OCR
-                const result = await worker.recognize(imageSrc);
-                const extractedText = result.data.text;
-                
-                if (!extractedText) throw new Error("Tesseract لم يتمكن من التعرف على أي نص في الصورة.");
+                const jsonText = result.candidates[0].content.parts[0].text;
+                const extractedData = JSON.parse(jsonText);
 
-                const extractedData = parseOCRText(extractedText);
-                
-                // Populate the EDITABLE input fields
+                // 5. Populate Input Fields
                 document.getElementById('extractedTrxIdInput').value = extractedData.trxIdLast4 || '';
                 document.getElementById('extractedDateInput').value = extractedData.date || '';
                 document.getElementById('extractedTimeInput').value = extractedData.time || '';
@@ -213,17 +229,17 @@
                 
                 document.getElementById('saveButton').disabled = false;
                 
-                showMessage('success', 'تم استخراج البيانات بنجاح! راجع وعدّل الحقول، ثم اضغط على "حفظ المعاملة".');
-                
+                showMessage('success', 'تم استخراج البيانات بنجاح باستخدام Gemini! راجع وعدّل الحقول، ثم اضغط على "حفظ المعاملة".', 'messageContainer');
+
             } catch (error) {
                 console.error("Scanning Error:", error);
-                showMessage('error', `فشل المسح: ${error.message}. نظراً لأن Tesseract يعتمد على جودة الصورة، لا يزال بإمكانك إدخال البيانات يدوياً وحفظها.`);
+                showMessage('error', `فشل المسح: ${error.message}. يرجى التحقق من جودة الصورة والمحاولة مرة أخرى.`, 'messageContainer');
             } finally {
                 setLoading('scanButton', false);
             }
         }
-
-        /** Step 2: Save Edited Data to LocalStorage */
+        
+        /** Step 2: Save Edited Data to Firestore */
         async function handleSaveTransaction() {
             const saveButton = document.getElementById('saveButton');
             if (saveButton.disabled) return;
@@ -239,13 +255,13 @@
                     amount: parseFloat(document.getElementById('extractedAmountInput').value) || 0,
                 };
 
-                if (data.amount === 0) {
-                     showMessage('error', 'المبلغ لا يمكن أن يكون صفراً. يرجى التحقق من البيانات المستخرجة.');
+                if (data.amount <= 0) {
+                     showMessage('error', 'المبلغ يجب أن يكون رقماً موجباً. يرجى التحقق من البيانات.', 'messageContainer');
                      setLoading('saveButton', false);
                      return;
                 }
 
-                saveTransaction(data); // Call the local storage save function
+                await saveTransaction(data); // Call the Firestore save function
 
                 // Reset fields after successful save
                 document.getElementById('extractedDateInput').value = '';
@@ -281,7 +297,7 @@
                 const [_, year, month] = monthYearInput.match(regex);
                 
                 filteredTransactions = transactionsData.filter(trx => {
-                    if (trx.date && trx.date.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                    if (trx.date && typeof trx.date === 'string' && trx.date.match(/^\d{4}-\d{2}-\d{2}$/)) {
                         return trx.date.startsWith(`${year}-${month}`);
                     }
                     return false;
@@ -327,9 +343,11 @@
                 
                 // Convert YYYY-MM-DD to DD-MM-YYYY for display
                 let dateDmy = dateYMD;
-                if (dateYMD !== 'N/A' && dateYMD.match(/^\d{4}-\d{2}-\d{2}$/)) {
-                    const [year, month, day] = dateYMD.split('-');
-                    dateDmy = `${day}-${month}-${year}`; 
+                if (dateYMD !== 'N/A' && typeof dateYMD === 'string' && dateYMD.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                    const parts = dateYMD.split('-');
+                    if (parts.length === 3) {
+                       dateDmy = `${parts[2]}-${parts[1]}-${parts[0]}`; 
+                    }
                 }
                 
                 html += `
@@ -351,7 +369,49 @@
             transactionsList.innerHTML = html.length > 0 ? html : '<p class="text-center text-gray-500 p-4">لم يتم حفظ أي معاملات بعد.</p>';
         }
 
-        /** Initialization */
+        /** Initialization and Authentication */
+        async function initFirebase() {
+            if (!firebaseConfig) {
+                showMessage('error', 'خطأ: لم يتم توفير إعدادات Firebase.', 'messageContainer');
+                return;
+            }
+
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('Debug'); // Enable debug logs for Firestore
+
+                // 1. Sign In
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // 2. Auth State Listener
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        document.getElementById('userIdDisplay').textContent = `معرّف المستخدم (للمشاركة): ${userId}`;
+                        setupTransactionListener(); // Start listening to Firestore data
+                    } else {
+                        userId = 'anonymous';
+                        isAuthReady = true; 
+                        document.getElementById('userIdDisplay').textContent = `وضع مجهول. البيانات لن تحفظ بشكل دائم.`;
+                        transactionsData = [];
+                        displayTransactionsHistory();
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+                showMessage('error', `فشل تهيئة Firebase أو تسجيل الدخول: ${error.message}`, 'messageContainer');
+            }
+        }
+
+        /** Run on Window Load */
         window.onload = function() {
             // Set the initial state for the app buttons
             document.getElementById('scanButton').dataset.originalText = 'مسح المعاملة';
@@ -359,8 +419,8 @@
             document.getElementById('filterButton').dataset.originalText = 'تصفية حسب الشهر';
             document.getElementById('saveButton').disabled = true;
 
-            // Load existing data from localStorage
-            loadTransactions(); 
+            // Initialize Firebase and start auth process
+            initFirebase(); 
             
             // App Listeners
             document.getElementById('scanButton').addEventListener('click', scanTransaction);
@@ -389,12 +449,6 @@
             });
         };
         
-        // Clean up Tesseract worker on window unload
-        window.onbeforeunload = async function() {
-            if (worker) {
-                await worker.terminate();
-            }
-        };
     </script>
     <style>
         /* Minimalist Custom styles */
@@ -448,18 +502,16 @@
     
     <!-- Main Application Container -->
     <div id="appContainer" class="container mx-auto bg-white p-6 sm:p-10 rounded-xl shadow-lg border border-gray-200 space-y-8">
-        <header class="text-center border-b pb-4 flex justify-between items-start">
-            <div>
-                <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800">
-                    💰 ماسح المعاملات البنكية (Tesseract.js)
-                </h1>
-                <p class="mt-2 text-base text-gray-600">
-                    استخراج البيانات باستخدام Tesseract OCR والتخزين المحلي (LocalStorage).
-                </p>
-                <p id="userIdDisplay" class="text-xs text-gray-500 mt-2 text-red-500">
-                    *ملاحظة: البيانات محفوظة محليًا في متصفحك فقط ولن تتم مشاركتها.*
-                </p>
-            </div>
+        <header class="text-center border-b pb-4">
+            <h1 class="text-3xl sm:text-4xl font-extrabold text-gray-800">
+                🚀 ماسح المعاملات البنكية (Gemini & Firestore)
+            </h1>
+            <p class="mt-2 text-base text-gray-600">
+                استخراج سريع للبيانات باستخدام Gemini API وتخزين سحابي احترافي عبر Firestore.
+            </p>
+            <p id="userIdDisplay" class="text-xs text-indigo-600 font-semibold mt-2">
+                جارٍ الاتصال بالنظام السحابي...
+            </p>
         </header>
 
         <div id="messageContainer"></div>
@@ -528,7 +580,7 @@
 
         <!-- SECTION 3: Transaction History -->
         <section class="space-y-4">
-            <h2 class="text-xl font-semibold text-gray-700 border-b pb-2">3. سجل المعاملات (التخزين المحلي)</h2>
+            <h2 class="text-xl font-semibold text-gray-700 border-b pb-2">3. سجل المعاملات (Firestore)</h2>
             
             <!-- Date Filter Inputs -->
             <div class="bg-gray-100 p-4 rounded-lg border border-gray-300 space-y-3">
@@ -556,17 +608,6 @@
             </div>
         </section>
         
-        <!-- Custom Delete Confirmation Modal -->
-        <div id="confirmDeleteModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50 hidden">
-            <div class="bg-white p-6 rounded-lg shadow-xl w-11/12 max-w-sm">
-                <h3 class="text-lg font-bold text-red-600 mb-3">تأكيد الحذف</h3>
-                <p class="text-gray-700 mb-4">هل أنت متأكد من رغبتك في حذف سجل المعاملة هذا نهائياً؟</p>
-                <div class="flex justify-start space-x-3 space-x-reverse">
-                    <button id="cancelDeleteButton" class="px-4 py-2 text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300 transition">إلغاء</button>
-                    <button id="confirmDeleteButton" class="px-4 py-2 text-white bg-red-600 rounded-md hover:bg-red-700 transition">حذف</button>
-                </div>
-            </div>
-        </div>
     </div>
     
 </body>
