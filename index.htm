@@ -69,9 +69,16 @@
         /** Register a new user by generating a PIN and associating it with a new anonymous UID. */
         async function registerPin() {
             const showPinDiv = document.getElementById('showPin');
-            setLoading('registerButton', true, 'جارٍ إنشاء الرمز...');
             showPinDiv.innerHTML = '';
             document.getElementById('authMessageContainer').innerHTML = '';
+
+            // CRITICAL CHECK: Ensure Firebase services are initialized
+            if (!isAuthReady || !auth || !db) {
+                showMessage('error', 'خطأ: لم يتم تهيئة اتصال قاعدة البيانات بشكل صحيح.', 'authMessageContainer');
+                return;
+            }
+
+            setLoading('registerButton', true, 'جارٍ إنشاء الرمز...');
 
             try {
                 // 1. Sign in anonymously if not already (ensures currentAuthUID is set)
@@ -123,8 +130,15 @@
         /** Logs in by checking the entered PIN against the registry. */
         async function loginByPIN() {
             const inputPin = document.getElementById('inputPin').value.trim();
-            setLoading('loginButton', true, 'جارٍ التحقق...');
             document.getElementById('authMessageContainer').innerHTML = '';
+            
+            // CRITICAL CHECK: Ensure Firebase services are initialized
+            if (!isAuthReady || !auth || !db) {
+                showMessage('error', 'خطأ: لم يتم تهيئة اتصال قاعدة البيانات بشكل صحيح.', 'authMessageContainer');
+                return;
+            }
+
+            setLoading('loginButton', true, 'جارٍ التحقق...');
 
             try {
                 if (inputPin.length !== 6 || isNaN(inputPin)) {
@@ -193,8 +207,8 @@
 
                 showMessage('success', 'تم تسجيل الخروج بنجاح.');
 
-                // Force a reload or sign-in anonymously again to get a fresh UID if needed,
-                // but usually, a simple sign out is enough to hide private data.
+                // Note: We don't sign out of Firebase itself to keep the anonymous UID, 
+                // but we hide the data by setting isAuthorized = false.
                 
             } catch (error) {
                 console.error("Sign Out Error:", error);
@@ -327,8 +341,9 @@
                 return;
             }
             
-            // تحقق إضافي لمنع التكرار
-            if (document.getElementById('saveButton').disabled) return;
+            // تحقق إضافي لمنع التكرار (منع الضغط المزدوج)
+            const saveButton = document.getElementById('saveButton');
+            if (saveButton.disabled) return;
 
 
             setLoading('saveButton', true, 'جارٍ الحفظ...');
@@ -369,6 +384,7 @@
                 console.error("Saving Error:", error);
                 showMessage('error', `فشل حفظ المعاملة: ${error.message}`);
             } finally {
+                // Ensure the button is re-enabled only if the function didn't return early due to an error
                 setLoading('saveButton', false, 'حفظ المعاملة');
             }
         }
@@ -403,9 +419,51 @@
             document.getElementById('cancelDeleteButton').onclick = () => confirmDelete.classList.add('hidden');
         }
         window.deleteTransaction = deleteTransaction; 
+        
+        /** Step 5: Filter Handler */
+        function handleMonthFilter() {
+            const monthYearInput = document.getElementById('monthYearInput').value.trim();
+            const regex = /^(\d{4})-(\d{2})$/; // YYYY-MM format
+
+            if (monthYearInput === "") {
+                // If empty, reset filter to show all
+                loadTransactionsHistory(null, null);
+                showMessage('success', 'تم إزالة التصفية. عرض جميع المعاملات.');
+                return;
+            }
+
+            if (!regex.test(monthYearInput)) {
+                showMessage('error', 'صيغة الشهر غير صحيحة. يجب أن تكون YYYY-MM، مثل 2024-05.', 'messageContainer');
+                return;
+            }
+
+            const [_, year, month] = monthYearInput.match(regex);
+            
+            // Calculate start and end dates for the month
+            // startDate is the first day of the selected month (YYYY-MM-01)
+            const startDate = `${year}-${month}-01`;
+            
+            // endDate is the last day of the selected month.
+            // Firestore queries are tricky: we look for transactions *before* the first day of the *next* month.
+            const nextMonth = parseInt(month) % 12 + 1;
+            const nextYear = parseInt(month) === 12 ? parseInt(year) + 1 : parseInt(year);
+            const nextMonthPadded = String(nextMonth).padStart(2, '0');
+            const endDateExclusive = `${nextYear}-${nextMonthPadded}-01`;
+            
+            // We use two 'where' clauses on the date string field:
+            // 1. date >= YYYY-MM-01 (Start of the month)
+            // 2. date < YYYY-(MM+1)-01 (Start of the next month)
+            // Note: Since Firestore requires the same field for all 'where' clauses, 
+            // we must ensure the saved 'date' field is a string in YYYY-MM-DD format.
+            
+            loadTransactionsHistory(startDate, endDateExclusive);
+            showMessage('success', `تطبيق التصفية بنجاح على: ${monthYearInput}.`);
+        }
+        window.handleMonthFilter = handleMonthFilter; // Make accessible from HTML (Fixes the ReferenceError)
+
 
         /** Step 4: Fetch and Display Transaction History */
-        function loadTransactionsHistory(startDate, endDate) {
+        function loadTransactionsHistory(startDate, endDateExclusive) {
             // التحقق من صلاحية المستخدم ومعرف Firebase UID
             if (!currentAuthUID || !isAuthorized) {
                 // Do not load if the application's logical userId is not set/ready
@@ -426,10 +484,14 @@
             if (startDate) {
                 queryConstraints.push(where('date', '>=', startDate));
             }
-            if (endDate) {
-                queryConstraints.push(where('date', '<=', endDate));
+            if (endDateExclusive) {
+                // To get all dates within the selected month, we query for dates LESS than the first day of the next month.
+                queryConstraints.push(where('date', '<', endDateExclusive));
             }
 
+            // IMPORTANT: Firestore does not support range queries (where('date', '>=', X) and where('date', '<', Y)) 
+            // unless all 'where' clauses are on the same field, which is true here ('date').
+            // We cannot order by timestamp efficiently in this case, so we rely on client-side sorting.
             const q = query(collection(db, collectionPath), ...queryConstraints); 
 
             transactionsList.innerHTML = '<p class="text-center text-gray-500 p-4">جارٍ تحميل المعاملات المحفوظة...</p>';
@@ -501,49 +563,38 @@
             });
         }
 
-        /** Handles Month/Year filter input to calculate date range */
-        function handleMonthFilter() {
-            const monthYearString = document.getElementById('monthYearInput').value.trim();
-
-            if (!monthYearString) {
-                // If empty, reload all data
-                loadTransactionsHistory(null, null);
-                return;
-            }
-
-            // Simple validation for YYYY-MM format
-            const parts = monthYearString.match(/^(\d{4})-(\d{2})$/);
-            if (!parts) {
-                showMessage('error', 'الرجاء إدخال الشهر والسنة بالتنسيق YYYY-MM بدقة (مثال: 2024-05).');
-                return;
-            }
-
-            const year = parseInt(parts[1]);
-            const month = parseInt(parts[2]); // 1-indexed month (1-12)
-
-            // Calculate the last day of the target month
-            const lastDayOfMonth = new Date(year, month, 0).getDate();
-            
-            // Construct the start and end date strings for Firestore filtering (YYYY-MM-DD)
-            const startDate = `${monthYearString}-01`;
-            const endDate = `${monthYearString}-${String(lastDayOfMonth).padStart(2, '0')}`;
-
-            loadTransactionsHistory(startDate, endDate);
-        }
-        window.handleMonthFilter = handleMonthFilter; // Make accessible from HTML
-
         /** Firebase Initialization and Auth */
         async function initializeFirebase() {
-            if (!firebaseConfig) return console.error("Firebase config is missing.");
+            const authScreen = document.getElementById('authScreen');
+            const appContainer = document.getElementById('appContainer');
+
+            if (!firebaseConfig) {
+                isAuthReady = false; // Set to false to prevent other Firebase calls
+                console.error("Firebase configuration is missing.");
+                
+                document.getElementById('authTitle').textContent = 'خطأ في التهيئة';
+                document.getElementById('authScreen').querySelector('.space-y-6').innerHTML = `
+                    <h2 class="text-3xl font-bold text-red-600 text-center">خطأ في إعداد Firebase</h2>
+                    <div class="p-4 rounded-lg border-r-4 bg-red-100 text-red-800 border-red-400 mb-4">
+                        <p class="font-bold mb-2">التطبيق غير قادر على الاتصال بقاعدة البيانات.</p>
+                        <p class="text-sm">
+                            هذا يحدث عادةً عند النشر خارج بيئة Canvas. يُرجى التأكد من توفر
+                            ` + "<code>__firebase_config</code>" + `
+                            في بيئة الاستضافة أو استخدام التطبيق في بيئة مدعومة.
+                        </p>
+                    </div>
+                `;
+                // Keep UI locked on error screen
+                appContainer.classList.add('hidden');
+                authScreen.classList.remove('hidden');
+                return; // CRITICAL: Exit early if config is missing
+            }
 
             setLogLevel('debug');
             const app = initializeApp(firebaseConfig);
             db = getFirestore(app);
             auth = getAuth(app);
 
-            const authScreen = document.getElementById('authScreen');
-            const appContainer = document.getElementById('appContainer');
-            
             // 1. Handle initial auth token from canvas (if provided)
             if (initialAuthToken) {
                 try {
@@ -597,6 +648,7 @@
             // App Listeners
             document.getElementById('scanButton').addEventListener('click', scanTransaction);
             document.getElementById('saveButton').addEventListener('click', saveTransaction);
+            // This is the fixed line: handleMonthFilter is now defined above.
             document.getElementById('filterButton').addEventListener('click', handleMonthFilter); 
             
             // Image Preview handler and field reset 
